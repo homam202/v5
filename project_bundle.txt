@@ -15,6 +15,7 @@ dependencies:
   flutter_blue_plus: ^1.32.0
   flutter_onnxruntime: any
   flutter_compass: ^0.8.0
+  audioplayers: ^6.1.0
   file_picker: ^8.1.0
   share_plus: ^10.1.0
   sqflite: ^2.3.0
@@ -25,6 +26,167 @@ flutter:
   uses-material-design: true
   assets:
     - assets/models/best2.onnx
+=== FILE: lib/ai/findings.dart ===
+import 'dart:math' as math;
+import 'onnx_service.dart';
+
+enum Verdict { realMetal, possibleMetal, realVoid, possibleVoid, looseSoil, reliable, possible, uncertain }
+
+/// One detected target (from the YOLO model and/or the rule-based detector).
+class Finding {
+  final String kind; // soil | void | moisture | organic | rock | metal
+  final String source; // 'AI' or 'Rule'
+  final double confidence; // 0..1
+  final double r0, c0, r1, c1; // cell bounds in ORIGINAL grid units (r1/c1 exclusive)
+  final double peakDelta; // signed extreme deviation from the normal level (counts)
+  final double widthCm, lengthCm, depthM;
+  final Verdict verdict;
+  const Finding(this.kind, this.source, this.confidence, this.r0, this.c0, this.r1, this.c1,
+      this.peakDelta, this.widthCm, this.lengthCm, this.depthM, this.verdict);
+}
+
+double _median(List<double> v) {
+  final s = [...v]..sort();
+  final n = s.length;
+  return n.isOdd ? s[n ~/ 2] : (s[n ~/ 2 - 1] + s[n ~/ 2]) / 2;
+}
+
+/// Combines the YOLO detections (if the model ran) with a rule-based detector.
+/// The rule-based part always works, so the analysis never returns empty-handed
+/// just because the neural network failed to load.
+List<Finding> buildFindings({
+  required List<List<double>> m, // raw values, no NaN
+  required int spacingCm,
+  required double thrCounts, // user threshold converted to sensor counts
+  required double soilFactor,
+  AiResult? yolo,
+}) {
+  final rows = m.length, cols = m.first.length;
+  final flat = m.expand((r) => r).toList();
+  final normal = _median(flat); // "normal soil value"
+  final sigma = 1.4826 * _median(flat.map((v) => (v - normal).abs()).toList());
+  final thr = math.max(thrCounts, 3 * sigma).clamp(1.0, 1e9).toDouble();
+
+  double depthAt(int pr, int pc) {
+    final peak = m[pr][pc] - normal;
+    final sign = peak >= 0 ? 1.0 : -1.0;
+    final half = peak.abs() / 2;
+    int run(int dr, int dc) {
+      var n = 0, r = pr + dr, c = pc + dc;
+      while (r >= 0 && r < rows && c >= 0 && c < cols && sign * (m[r][c] - normal) >= half) {
+        n++;
+        r += dr;
+        c += dc;
+      }
+      return n;
+    }
+
+    final w = ((run(0, -1) + run(0, 1) + 1) + (run(-1, 0) + run(1, 0) + 1)) / 2;
+    final fwhm = w * spacingCm / 100; // metres
+    return (fwhm / 1.5 * soilFactor).clamp(0.1, 5.0).toDouble(); // rough dipole rule of thumb
+  }
+
+  Verdict verdictFor(String kind, double conf, double peak) {
+    final okMetal = peak > 0.8 * thr, okVoid = peak < -0.8 * thr;
+    if (kind == 'metal') {
+      if (okMetal) return conf >= 0.6 ? Verdict.realMetal : Verdict.possibleMetal;
+      return conf >= 0.35 ? Verdict.looseSoil : Verdict.uncertain;
+    }
+    if (kind == 'void') {
+      if (okVoid) return conf >= 0.6 ? Verdict.realVoid : Verdict.possibleVoid;
+      return conf >= 0.35 ? Verdict.looseSoil : Verdict.uncertain;
+    }
+    return conf >= 0.6 ? Verdict.reliable : (conf >= 0.4 ? Verdict.possible : Verdict.uncertain);
+  }
+
+  final out = <Finding>[];
+
+  // ---- 1) YOLO detections -> cell coordinates --------------------------
+  if (yolo != null) {
+    final scale = math.min(640 / cols, 640 / rows);
+    final x0 = (640 - cols * scale) / 2, y0 = (640 - rows * scale) / 2;
+    for (final d in yolo.detections.take(12)) {
+      final c0 = ((d.x1 - x0) / scale).clamp(0.0, cols - 1.0).toDouble();
+      final r0 = ((d.y1 - y0) / scale).clamp(0.0, rows - 1.0).toDouble();
+      final c1 = ((d.x2 - x0) / scale).clamp(c0 + 1, cols.toDouble()).toDouble();
+      final r1 = ((d.y2 - y0) / scale).clamp(r0 + 1, rows.toDouble()).toDouble();
+      var peak = 0.0, pr = r0.floor(), pc = c0.floor();
+      for (var r = r0.floor(); r < r1.ceil() && r < rows; r++) {
+        for (var c = c0.floor(); c < c1.ceil() && c < cols; c++) {
+          final dv = m[r][c] - normal;
+          if (dv.abs() > peak.abs()) {
+            peak = dv;
+            pr = r;
+            pc = c;
+          }
+        }
+      }
+      out.add(Finding(d.label, 'AI', d.confidence, r0, c0, r1, c1, peak,
+          (c1 - c0) * spacingCm, (r1 - r0) * spacingCm, depthAt(pr, pc),
+          verdictFor(d.label, d.confidence, peak)));
+    }
+  }
+
+  // ---- 2) rule-based detector: connected components over/under normal ----
+  final seen = List.generate(rows, (_) => List.filled(cols, false));
+  for (var r = 0; r < rows; r++) {
+    for (var c = 0; c < cols; c++) {
+      final dv = m[r][c] - normal;
+      if (seen[r][c] || dv.abs() <= thr) continue;
+      final sign = dv > 0 ? 1.0 : -1.0;
+      final stack = [(r, c)];
+      seen[r][c] = true;
+      var rMin = r, rMax = r, cMin = c, cMax = c, area = 0, pr = r, pc = c;
+      var peak = dv;
+      while (stack.isNotEmpty) {
+        final (cr, cc) = stack.removeLast();
+        area++;
+        rMin = math.min(rMin, cr);
+        rMax = math.max(rMax, cr);
+        cMin = math.min(cMin, cc);
+        cMax = math.max(cMax, cc);
+        final v = m[cr][cc] - normal;
+        if (v.abs() > peak.abs()) {
+          peak = v;
+          pr = cr;
+          pc = cc;
+        }
+        for (final (dr, dc) in [(1, 0), (-1, 0), (0, 1), (0, -1)]) {
+          final nr = cr + dr, nc = cc + dc;
+          if (nr < 0 || nr >= rows || nc < 0 || nc >= cols || seen[nr][nc]) continue;
+          final nv = m[nr][nc] - normal;
+          if (nv * sign > thr) {
+            seen[nr][nc] = true;
+            stack.add((nr, nc));
+          }
+        }
+      }
+      final ratio = peak.abs() / thr;
+      if (area == 1 && ratio < 2) continue; // lone weak cell = noise
+      final compact = ratio >= 2 || area <= 4;
+      final kind = sign > 0 ? (compact ? 'metal' : 'rock') : (compact ? 'void' : 'moisture');
+      var conf = math.min(0.9, ratio / (ratio + 1.5));
+      if (!compact) conf *= 0.7;
+      final f = Finding(kind, 'Rule', conf, rMin.toDouble(), cMin.toDouble(), rMax + 1.0, cMax + 1.0,
+          peak, (cMax - cMin + 1) * spacingCm.toDouble(), (rMax - rMin + 1) * spacingCm.toDouble(),
+          depthAt(pr, pc), verdictFor(kind, conf, peak));
+      // skip if an AI box already covers this spot
+      final dup = out.any((o) => o.source == 'AI' && _iou(o, f) > 0.25);
+      if (!dup) out.add(f);
+    }
+  }
+
+  out.sort((a, b) => b.confidence.compareTo(a.confidence));
+  return out;
+}
+
+double _iou(Finding a, Finding b) {
+  final ix = math.max(0.0, math.min(a.c1, b.c1) - math.max(a.c0, b.c0));
+  final iy = math.max(0.0, math.min(a.r1, b.r1) - math.max(a.r0, b.r0));
+  final inter = ix * iy;
+  final u = (a.c1 - a.c0) * (a.r1 - a.r0) + (b.c1 - b.c0) * (b.r1 - b.r0) - inter;
+  return u <= 0 ? 0 : inter / u;
+}
 === FILE: lib/ai/heatmap_renderer.dart ===
 import 'dart:typed_data';
 import '../features/analysis_3d/grid_processor.dart' show ScanStats, jetRelative;
@@ -35,7 +197,7 @@ import '../features/analysis_3d/grid_processor.dart' show ScanStats, jetRelative
 class HeatmapRenderer {
   static const int size = 640;
 
-  static Float32List toTensor(List<List<double>> raw, {bool detrend = true}) {
+  static Float32List toTensor(List<List<double>> raw, {bool detrend = true, bool imagenet = false}) {
     var m = detrend ? removePlane(raw) : raw;
     final rows = m.length, cols = m.first.length;
 
@@ -51,8 +213,13 @@ class HeatmapRenderer {
     final x0 = (size - w) ~/ 2, y0 = (size - h) ~/ 2;
 
     const pad = 114 / 255.0;
+    const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
+    double nrm(double v, int ch) => imagenet ? (v - mean[ch]) / std[ch] : v;
     final plane = size * size;
-    final out = Float32List(3 * plane)..fillRange(0, 3 * plane, pad);
+    final out = Float32List(3 * plane);
+    for (var ch = 0; ch < 3; ch++) {
+      out.fillRange(ch * plane, (ch + 1) * plane, nrm(pad, ch));
+    }
 
     for (var y = 0; y < h; y++) {
       final fy = ((y + 0.5) / scale - 0.5).clamp(0.0, rows - 1.0);
@@ -61,9 +228,9 @@ class HeatmapRenderer {
         final v = bicubic(m, fy, fx).clamp(lo, hi); // clamp kills overshoot
         final (r, g, b) = jetRelative(v, stats);
         final p = (y0 + y) * size + (x0 + x);
-        out[p] = r;
-        out[plane + p] = g;
-        out[2 * plane + p] = b;
+        out[p] = nrm(r, 0);
+        out[plane + p] = nrm(g, 1);
+        out[2 * plane + p] = nrm(b, 2);
       }
     }
     return out;
@@ -173,6 +340,8 @@ class OnnxService {
     List<List<double>> raw, {
     double confThreshold = 0.25,
     double iouThreshold = 0.45,
+    bool detrend = true,
+    bool imagenet = false,
   }) async {
     if (_session == null) throw OnnxServiceException('Call init() first.');
     if (_busy) throw OnnxServiceException('Inference already running.');
@@ -185,7 +354,7 @@ class OnnxService {
     Map<String, OrtValue>? outputs;
     try {
       // a+b+c) detrend + bicubic + relative-Jet heatmap -> flat Float32List, NCHW order (heavy loop: run off the UI isolate)
-      final Float32List tensor = await compute(_buildTensor, raw);
+      final Float32List tensor = await compute(_buildTensor, (raw, detrend, imagenet));
 
       // c) shape [1,3,640,640]
       input = await OrtValue.fromList(tensor, [1, 3, HeatmapRenderer.size, HeatmapRenderer.size]);
@@ -224,7 +393,8 @@ class OnnxService {
   }
 
   // ---- helpers ---------------------------------------------------------
-  static Float32List _buildTensor(List<List<double>> m) => HeatmapRenderer.toTensor(m);
+  static Float32List _buildTensor((List<List<double>>, bool, bool) a) =>
+      HeatmapRenderer.toTensor(a.$1, detrend: a.$2, imagenet: a.$3);
 
   /// Output layout is channel-major: value(c, i) = flat[c * 8400 + i].
   static AiResult _decode(Float32List f, double conf, double iou) {
@@ -319,13 +489,45 @@ String tr(BuildContext c, String en, String ar) =>
     Localizations.localeOf(c).languageCode == 'ar' ? ar : en;
 === FILE: lib/features/analysis_3d/analysis_screen.dart ===
 import 'package:flutter/material.dart';
-import '../../ai/onnx_service.dart';
+import 'package:flutter/services.dart';
+import '../../ai/findings.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/utils/i18n.dart';
 import '../../services/app_state.dart';
+import '../../widgets/heatmap_painter.dart';
 import '../../widgets/iso_grid_painter.dart';
 import 'filters.dart';
 import 'grid_processor.dart';
+import 'soil_types.dart';
+
+Color kindColor(String k) => switch (k) {
+      'metal' => TM.gold,
+      'void' => TM.cyan,
+      'rock' => const Color(0xFFFF9800),
+      'moisture' => const Color(0xFF64B5F6),
+      'soil' => const Color(0xFFA1887F),
+      _ => const Color(0xFF81C784),
+    };
+
+String kindName(BuildContext c, String k) => switch (k) {
+      'metal' => tr(c, 'Metal', 'معدن'),
+      'void' => tr(c, 'Void', 'فراغ'),
+      'rock' => tr(c, 'Rock', 'صخر'),
+      'soil' => tr(c, 'Soil', 'تربة'),
+      'moisture' => tr(c, 'Moisture', 'رطوبة'),
+      _ => tr(c, 'Organic', 'عضوي'),
+    };
+
+String verdictText(BuildContext c, Verdict v) => switch (v) {
+      Verdict.realMetal => tr(c, 'Real metal likely', 'معدن حقيقي مرجّح'),
+      Verdict.possibleMetal => tr(c, 'Possible metal', 'معدن محتمل'),
+      Verdict.realVoid => tr(c, 'Real void likely', 'فراغ حقيقي مرجّح'),
+      Verdict.possibleVoid => tr(c, 'Possible void', 'فراغ محتمل'),
+      Verdict.looseSoil => tr(c, 'May be loose soil', 'قد تكون تربة رخوة'),
+      Verdict.reliable => tr(c, 'Reliable detection', 'كشف موثوق'),
+      Verdict.possible => tr(c, 'Possible detection', 'كشف محتمل'),
+      Verdict.uncertain => tr(c, 'Uncertain detection', 'كشف غير مؤكد'),
+    };
 
 class AnalysisScreen extends StatefulWidget {
   const AnalysisScreen({super.key});
@@ -339,31 +541,39 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
   final hidden = <Layer>{};
   double depth = 1, rot = 0.6;
   bool volumetric = false, loading = false;
-  String? error;
-  AiResult? result;
+  int view = 0; // 0 = 3D, 1 = 2D map, 2 = values, 3 = profile
+  int profileIdx = 0;
+  bool profileRow = true;
+  List<Finding>? findings;
+  bool onnxOk = false;
+  String? onnxError;
 
   Future<void> _runAi() async {
-    setState(() {
-      loading = true;
-      error = null;
-    });
+    setState(() => loading = true);
+    final raw = s.grid.filled();
+    dynamic yolo;
+    String? err;
     try {
       await s.onnx.init();
-      result = await s.onnx.analyze(s.grid.filled());
+      yolo = await s.onnx.analyze(raw,
+          confThreshold: s.aiConf.value, detrend: s.aiDetrend.value, imagenet: s.aiImageNet.value);
     } catch (e) {
-      error = e.toString();
+      err = e.toString();
     }
-    if (mounted) setState(() => loading = false);
-  }
-
-  /// Convert the top detection box (640x640 letterbox space) to cell units.
-  Rect? _highlight(int rows, int cols, int factor) {
-    final d = result?.top;
-    if (d == null || filters.rotation % 4 != 0) return null;
-    final scale = (640 / cols) < (640 / rows) ? 640 / cols : 640 / rows;
-    final x0 = (640 - cols * scale) / 2, y0 = (640 - rows * scale) / 2;
-    return Rect.fromLTRB((d.x1 - x0) / scale * factor, (d.y1 - y0) / scale * factor,
-        (d.x2 - x0) / scale * factor, (d.y2 - y0) / scale * factor);
+    final f = buildFindings(
+      m: raw,
+      spacingCm: s.grid.spacingCm,
+      thrCounts: s.thresholdNt.value / s.ntPerCount.value,
+      soilFactor: soilTypes[s.soil.value].factor,
+      yolo: yolo,
+    );
+    if (!mounted) return;
+    setState(() {
+      findings = f;
+      onnxOk = yolo != null;
+      onnxError = err;
+      loading = false;
+    });
   }
 
   String _layerName(BuildContext c, Layer l) => switch (l) {
@@ -403,67 +613,151 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
         builder: (_, __) {
           final has = s.grid.hasData;
           final (m, factor) = applyFilters(s.grid.filled(), filters);
-          return Stack(children: [
-            GestureDetector(
-              onPanUpdate: (d) => setState(() => rot += d.delta.dx * 0.01),
-              child: CustomPaint(
-                size: Size.infinite,
-                painter: IsoGridPainter(m,
-                    depth: depth,
-                    volumetric: volumetric,
-                    rotation: rot,
-                    hidden: hidden,
-                    highlight: _highlight(s.grid.rows, s.grid.cols, factor)),
-              ),
+          final noRot = filters.rotation % 4 == 0;
+          final fl = noRot ? (findings ?? const <Finding>[]) : const <Finding>[];
+          return Column(children: [
+            Expanded(
+              child: Stack(children: [
+                _body(context, m, factor, fl),
+                if (!has) _empty(context),
+                if (view <= 1)
+                  PositionedDirectional(end: 8, top: 8, width: 160, child: _aiCard(context)),
+              ]),
             ),
-            if (!has)
-              Center(
-                child: Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(mainAxisSize: MainAxisSize.min, children: [
-                      const Icon(Icons.view_in_ar, size: 40, color: TM.cyan),
-                      const SizedBox(height: 8),
-                      Text(tr(context, 'No scan data yet', 'لا توجد بيانات مسح'), style: const TextStyle(fontWeight: FontWeight.bold)),
-                      const SizedBox(height: 8),
-                      OutlinedButton(onPressed: s.grid.fillDemo, child: Text(tr(context, 'Load demo survey', 'تحميل مسح تجريبي'))),
-                    ]),
-                  ),
-                ),
-              ),
-            // Field info (top-start)
-            PositionedDirectional(
-              start: 12, top: 8,
-              child: Text(
-                '${s.grid.rows}×${s.grid.cols} • ${s.grid.spacingCm} cm\n'
-                '${s.grid.fieldWidthM.toStringAsFixed(1)} × ${s.grid.fieldHeightM.toStringAsFixed(1)} m',
-                style: const TextStyle(fontSize: 12, color: TM.grey),
-              ),
-            ),
-            // AI card (right side)
-            PositionedDirectional(end: 8, top: 56, width: 156, child: _aiCard(context)),
-            // Bottom panel
-            Positioned(left: 0, right: 0, bottom: 0, child: _bottomPanel(context)),
+            _bottomPanel(context),
           ]);
         },
       ),
     );
   }
 
+  // ---------------------------------------------------------------- views
+  Widget _body(BuildContext context, List<List<double>> m, int factor, List<Finding> fl) {
+    switch (view) {
+      case 1:
+        return CustomPaint(
+          size: Size.infinite,
+          painter: HeatmapPainter(m, [
+            for (final f in fl)
+              HeatBox(
+                Rect.fromLTRB(f.c0 * factor, f.r0 * factor, f.c1 * factor, f.r1 * factor),
+                '${kindName(context, f.kind)} ${(f.confidence * 100).round()}%',
+                kindColor(f.kind),
+              )
+          ]),
+        );
+      case 2:
+        return _valuesView(m);
+      case 3:
+        return _profileView(context);
+      default:
+        final top = fl.isEmpty ? null : fl.first;
+        return GestureDetector(
+          onPanUpdate: (d) => setState(() => rot += d.delta.dx * 0.01),
+          child: CustomPaint(
+            size: Size.infinite,
+            painter: IsoGridPainter(m,
+                depth: depth,
+                volumetric: volumetric,
+                rotation: rot,
+                hidden: hidden,
+                highlight: top == null
+                    ? null
+                    : Rect.fromLTRB(top.c0 * factor, top.r0 * factor, top.c1 * factor, top.r1 * factor)),
+          ),
+        );
+    }
+  }
+
+  Widget _empty(BuildContext context) => Center(
+        child: Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              const Icon(Icons.view_in_ar, size: 40, color: TM.cyan),
+              const SizedBox(height: 8),
+              Text(tr(context, 'No scan data yet', 'لا توجد بيانات مسح'), style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              OutlinedButton(onPressed: s.grid.fillDemo, child: Text(tr(context, 'Load demo survey', 'تحميل مسح تجريبي'))),
+            ]),
+          ),
+        ),
+      );
+
+  Widget _valuesView(List<List<double>> m) {
+    final flat = m.expand((r) => r).toList();
+    final st = ScanStats(flat.reduce((a, b) => a < b ? a : b), flat.reduce((a, b) => a + b) / flat.length,
+        flat.reduce((a, b) => a > b ? a : b));
+    return InteractiveViewer(
+      constrained: false,
+      minScale: 0.5,
+      maxScale: 3,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Table(
+          defaultColumnWidth: const FixedColumnWidth(42),
+          children: [
+            for (final row in m)
+              TableRow(children: [
+                for (final v in row)
+                  Container(
+                    height: 26,
+                    alignment: Alignment.center,
+                    color: jetRelativeColor(v, st).withOpacity(0.75),
+                    child: Text(v.round().toString(),
+                        style: const TextStyle(fontSize: 10, color: Colors.black, fontWeight: FontWeight.w600)),
+                  ),
+              ]),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _profileView(BuildContext context) {
+    final g = s.grid;
+    final mat = g.filled();
+    final n = profileRow ? g.rows : g.cols;
+    final idx = profileIdx.clamp(0, n - 1);
+    final vals = profileRow ? mat[idx] : [for (final r in mat) r[idx]];
+    final flat = mat.expand((r) => r).toList()..sort();
+    final normal = flat[flat.length ~/ 2];
+    final thr = s.thresholdNt.value / s.ntPerCount.value;
+    return Column(children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+        child: Row(children: [
+          SegmentedButton<bool>(
+            segments: [
+              ButtonSegment(value: true, label: Text(tr(context, 'Row', 'صف'))),
+              ButtonSegment(value: false, label: Text(tr(context, 'Column', 'عمود'))),
+            ],
+            selected: {profileRow},
+            onSelectionChanged: (v) => setState(() {
+              profileRow = v.first;
+              profileIdx = 0;
+            }),
+          ),
+          Expanded(
+            child: Slider(
+              value: idx.toDouble(),
+              min: 0,
+              max: (n - 1).toDouble(),
+              divisions: n > 1 ? n - 1 : null,
+              label: '${idx + 1}',
+              onChanged: (v) => setState(() => profileIdx = v.round()),
+            ),
+          ),
+          Text('${idx + 1}/$n'),
+        ]),
+      ),
+      Expanded(child: CustomPaint(size: Size.infinite, painter: ProfilePainter(vals, normal, thr))),
+    ]);
+  }
+
+  // ------------------------------------------------------------ AI card
   Widget _aiCard(BuildContext context) {
-    final best = result?.bestPerClass ?? {};
-    final top3 = (best.entries.where((e) => e.value > 0).toList()
-          ..sort((a, b) => b.value.compareTo(a.value)))
-        .take(3)
-        .toList();
-    String name(String k) => switch (k) {
-          'metal' => tr(context, 'Metal', 'معدن'),
-          'void' => tr(context, 'Void', 'فراغ'),
-          'rock' => tr(context, 'Rock', 'صخر'),
-          'soil' => tr(context, 'Soil', 'تربة'),
-          'moisture' => tr(context, 'Moisture', 'رطوبة'),
-          _ => tr(context, 'Organic', 'عضوي'),
-        };
+    final fl = findings;
     return Container(
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
@@ -479,26 +773,130 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
         ]),
         const SizedBox(height: 6),
         if (loading) const LinearProgressIndicator(),
-        if (error != null) Text(error!, maxLines: 4, overflow: TextOverflow.ellipsis, style: const TextStyle(color: TM.hot, fontSize: 11)),
-        if (!loading && error == null && result != null && top3.isEmpty)
-          Text(tr(context, 'No anomaly detected', 'لا توجد شاذّة'), style: const TextStyle(color: TM.grey)),
-        for (var i = 0; i < top3.length; i++) ...[
-          Text('${name(top3[i].key)}: ${(top3[i].value * 100).round()}%',
-              style: TextStyle(fontWeight: FontWeight.bold, color: i == 0 ? TM.gold : Colors.white)),
-          Padding(
-            padding: const EdgeInsets.only(top: 2, bottom: 6),
-            child: LinearProgressIndicator(value: top3[i].value, minHeight: 6, color: i == 0 ? TM.gold : TM.cyan, backgroundColor: Colors.white12),
+        if (fl != null && !loading) ...[
+          Row(children: [
+            Icon(onnxOk ? Icons.check_circle : Icons.error_outline, size: 14, color: onnxOk ? TM.cyan : TM.gold),
+            const SizedBox(width: 4),
+            Expanded(
+              child: GestureDetector(
+                onTap: onnxError == null ? null : () => _showError(context),
+                child: Text(
+                  onnxOk
+                      ? tr(context, 'AI model + rules', 'نموذج الذكاء + القواعد')
+                      : tr(context, 'Rules only (tap: error)', 'القواعد فقط (اضغط للخطأ)'),
+                  style: TextStyle(fontSize: 11, color: onnxOk ? TM.grey : TM.gold),
+                ),
+              ),
+            ),
+          ]),
+          const SizedBox(height: 4),
+          if (fl.isEmpty)
+            Text(tr(context, 'No anomaly detected', 'لا توجد شاذّة'), style: const TextStyle(color: TM.grey)),
+          for (var i = 0; i < fl.length && i < 3; i++) ...[
+            Text('${kindName(context, fl[i].kind)}: ${(fl[i].confidence * 100).round()}%',
+                style: TextStyle(fontWeight: FontWeight.bold, color: i == 0 ? TM.gold : Colors.white)),
+            Padding(
+              padding: const EdgeInsets.only(top: 2, bottom: 6),
+              child: LinearProgressIndicator(value: fl[i].confidence, minHeight: 6, color: kindColor(fl[i].kind), backgroundColor: Colors.white12),
+            ),
+          ],
+        ],
+        const SizedBox(height: 2),
+        Row(children: [
+          Expanded(
+            child: FilledButton.icon(
+              onPressed: loading || !s.grid.hasData ? null : _runAi,
+              icon: const Icon(Icons.bolt, size: 18),
+              label: Text(tr(context, 'Analyze', 'تحليل')),
+            ),
+          ),
+          if (fl != null && fl.isNotEmpty)
+            IconButton(
+              tooltip: tr(context, 'Detections list', 'قائمة الكشوفات'),
+              onPressed: () => _showList(context, fl),
+              icon: Badge(label: Text('${fl.length}'), child: const Icon(Icons.list_alt, color: TM.gold)),
+            ),
+        ]),
+      ]),
+    );
+  }
+
+  void _showError(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(tr(ctx, 'AI model error', 'خطأ نموذج الذكاء')),
+        content: SingleChildScrollView(child: SelectableText(onnxError ?? '')),
+        actions: [
+          TextButton(
+            onPressed: () => Clipboard.setData(ClipboardData(text: onnxError ?? '')),
+            child: Text(tr(ctx, 'Copy', 'نسخ')),
+          ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: Text(tr(ctx, 'Close', 'إغلاق'))),
+        ],
+      ),
+    );
+  }
+
+  void _showList(BuildContext context, List<Finding> fl) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: TM.navySurface,
+      isScrollControlled: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.6,
+        maxChildSize: 0.9,
+        builder: (_, sc) => ListView(controller: sc, padding: const EdgeInsets.all(16), children: [
+          Text('${tr(ctx, 'Detections', 'الكشوفات')} (${fl.length})', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          for (final f in fl)
+            Card(
+              child: ListTile(
+                leading: CircleAvatar(backgroundColor: kindColor(f.kind), child: Text('${(f.confidence * 100).round()}', style: const TextStyle(color: TM.navy, fontWeight: FontWeight.bold, fontSize: 12))),
+                title: Text('${kindName(ctx, f.kind)} • ${verdictText(ctx, f.verdict)}'),
+                subtitle: Text(
+                  '${tr(ctx, 'Size', 'الحجم')}: ${f.widthCm.round()}×${f.lengthCm.round()} cm\n'
+                  '${tr(ctx, 'Est. depth', 'العمق التقريبي')}: ${f.depthM.toStringAsFixed(2)} m  '
+                  '(${soilTypes[s.soil.value].en})\n'
+                  '${tr(ctx, 'Source', 'المصدر')}: ${f.source == 'AI' ? tr(ctx, 'AI model', 'نموذج الذكاء') : tr(ctx, 'Rule-based', 'قواعد')}',
+                ),
+                isThreeLine: true,
+              ),
+            ),
+          Text(tr(ctx, 'Depth and size are rough estimates; confirm in the field.', 'العمق والحجم تقديران تقريبيان؛ تحقق منهما ميدانيًا.'),
+              style: const TextStyle(color: TM.grey, fontSize: 12)),
+        ]),
+      ),
+    );
+  }
+
+  // ------------------------------------------------------- bottom panel
+  void _pickSoil(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: Text(tr(ctx, 'Soil type (for depth)', 'نوع التربة (لتقدير العمق)')),
+        children: [
+          SizedBox(
+            width: double.maxFinite,
+            height: 380,
+            child: ListView(children: [
+              for (var i = 0; i < soilTypes.length; i++)
+                ListTile(
+                  dense: true,
+                  leading: Icon(i == s.soil.value ? Icons.radio_button_checked : Icons.radio_button_off, color: TM.cyan),
+                  title: Text(tr(ctx, soilTypes[i].en, soilTypes[i].ar)),
+                  onTap: () {
+                    s.soil.value = i;
+                    Navigator.pop(ctx);
+                    setState(() {});
+                  },
+                ),
+            ]),
           ),
         ],
-        SizedBox(
-          width: double.infinity,
-          child: FilledButton.icon(
-            onPressed: loading || !s.grid.hasData ? null : _runAi,
-            icon: const Icon(Icons.bolt, size: 18),
-            label: Text(tr(context, 'Analyze', 'تحليل')),
-          ),
-        ),
-      ]),
+      ),
     );
   }
 
@@ -522,7 +920,6 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
         borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
       ),
       child: Column(mainAxisSize: MainAxisSize.min, children: [
-        // Colour legend
         Row(children: [
           Text('${st.min.round()}', style: const TextStyle(fontSize: 11, color: TM.grey)),
           const SizedBox(width: 6),
@@ -540,27 +937,51 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
           const SizedBox(width: 6),
           Text('${st.max.round()}', style: const TextStyle(fontSize: 11, color: TM.grey)),
         ]),
+        const SizedBox(height: 6),
         Row(children: [
-          const Icon(Icons.layers, color: TM.cyan),
-          Expanded(child: Slider(value: depth, min: 0.2, max: 2, onChanged: (v) => setState(() => depth = v))),
-          Text(tr(context, 'Volumetric', 'حجمي')),
-          Switch(value: volumetric, onChanged: (v) => setState(() => volumetric = v)),
+          Expanded(
+            child: SegmentedButton<int>(
+              showSelectedIcon: false,
+              segments: const [
+                ButtonSegment(value: 0, icon: Icon(Icons.view_in_ar, size: 18), label: Text('3D')),
+                ButtonSegment(value: 1, icon: Icon(Icons.grid_on, size: 18), label: Text('2D')),
+                ButtonSegment(value: 2, icon: Icon(Icons.pin, size: 18), label: Text('123')),
+                ButtonSegment(value: 3, icon: Icon(Icons.show_chart, size: 18), label: Text('Y')),
+              ],
+              selected: {view},
+              onSelectionChanged: (v) => setState(() => view = v.first),
+            ),
+          ),
+          const SizedBox(width: 8),
+          ActionChip(
+            avatar: const Icon(Icons.terrain, size: 16),
+            label: Text(tr(context, soilTypes[s.soil.value].en, soilTypes[s.soil.value].ar)),
+            onPressed: () => _pickSoil(context),
+          ),
         ]),
-        SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: Row(children: [
-            chip(tr(context, 'Error Correction', 'تصحيح الأخطاء'), filters.errorCorrection,
-                () => setState(() => filters.errorCorrection = !filters.errorCorrection), icon: Icons.healing),
-            chip(tr(context, 'Interpolation', 'استيفاء'), filters.interpolation,
-                () => setState(() => filters.interpolation = !filters.interpolation), icon: Icons.blur_on),
-            chip(tr(context, 'Signal Correction', 'تصحيح الإشارة'), filters.signalCorrection,
-                () => setState(() => filters.signalCorrection = !filters.signalCorrection), icon: Icons.show_chart),
-            chip(tr(context, 'Subdivision', 'تقسيم'), filters.subdivision,
-                () => setState(() => filters.subdivision = !filters.subdivision), icon: Icons.grid_view),
-            chip('${tr(context, 'Rotation', 'تدوير')} ${filters.rotation % 4 * 90}°', filters.rotation % 4 != 0,
-                () => setState(() => filters.rotation = (filters.rotation + 1) % 4), icon: Icons.rotate_90_degrees_cw),
+        if (view == 0)
+          Row(children: [
+            const Icon(Icons.layers, color: TM.cyan),
+            Expanded(child: Slider(value: depth, min: 0.2, max: 2, onChanged: (v) => setState(() => depth = v))),
+            Text(tr(context, 'Volumetric', 'حجمي')),
+            Switch(value: volumetric, onChanged: (v) => setState(() => volumetric = v)),
           ]),
-        ),
+        if (view <= 2)
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(children: [
+              chip(tr(context, 'Error Correction', 'تصحيح الأخطاء'), filters.errorCorrection,
+                  () => setState(() => filters.errorCorrection = !filters.errorCorrection), icon: Icons.healing),
+              chip(tr(context, 'Interpolation', 'استيفاء'), filters.interpolation,
+                  () => setState(() => filters.interpolation = !filters.interpolation), icon: Icons.blur_on),
+              chip(tr(context, 'Signal Correction', 'تصحيح الإشارة'), filters.signalCorrection,
+                  () => setState(() => filters.signalCorrection = !filters.signalCorrection), icon: Icons.show_chart),
+              chip(tr(context, 'Subdivision', 'تقسيم'), filters.subdivision,
+                  () => setState(() => filters.subdivision = !filters.subdivision), icon: Icons.grid_view),
+              chip('${tr(context, 'Rotation', 'تدوير')} ${filters.rotation % 4 * 90}°', filters.rotation % 4 != 0,
+                  () => setState(() => filters.rotation = (filters.rotation + 1) % 4), icon: Icons.rotate_90_degrees_cw),
+            ]),
+          ),
       ]),
     );
   }
@@ -782,6 +1203,31 @@ Layer layerOf(double v, ScanStats s) {
   if (v < (a[3] + a[4]) / 2) return Layer.minerals;
   return Layer.metals;
 }
+=== FILE: lib/features/analysis_3d/soil_types.dart ===
+/// Soil presets used by the depth estimate. The factors are rough, empirical
+/// multipliers (1.0 = neutral) - calibrate them against your own field tests.
+class SoilType {
+  final String id, en, ar;
+  final double factor;
+  const SoilType(this.id, this.en, this.ar, this.factor);
+}
+
+const soilTypes = <SoilType>[
+  SoilType('neutral', 'Neutral', 'متعادلة', 1.00),
+  SoilType('sandy', 'Sandy soil', 'تربة رملية', 1.05),
+  SoilType('clay', 'Clay soil', 'تربة طينية', 0.85),
+  SoilType('silt', 'Silt', 'طمي', 0.95),
+  SoilType('rocky', 'Rocky / stony', 'تربة صخرية', 1.10),
+  SoilType('basaltic', 'Basaltic soil', 'تربة بازلتية', 0.80),
+  SoilType('limestone', 'Limestone soil', 'تربة كلسية', 1.05),
+  SoilType('dry', 'Dry soil', 'تربة جافة', 1.05),
+  SoilType('wet', 'Wet soil', 'تربة رطبة', 0.90),
+  SoilType('saline', 'Saline soil', 'تربة مالحة', 0.85),
+  SoilType('organic', 'Organic soil', 'تربة عضوية', 1.00),
+  SoilType('agri', 'Agricultural soil', 'تربة زراعية', 1.00),
+  SoilType('gravel', 'Gravelly soil', 'تربة حصوية', 1.05),
+  SoilType('concrete', 'Concrete surface', 'سطح خرساني', 1.10),
+];
 === FILE: lib/features/connect/connect_screen.dart ===
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -1062,6 +1508,38 @@ void showSettingsSheet(BuildContext context) {
                 child: Text('${tr(ctx, 'Scale', 'المعامل')}: ${v.toStringAsFixed(2)} nT / count'),
               ),
               Slider(value: v, min: 0.1, max: 5, onChanged: (x) => s.ntPerCount.value = x),
+            ]),
+          ),
+          const Divider(),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: Text(tr(ctx, 'AI options', 'خيارات الذكاء الاصطناعي'), style: const TextStyle(fontWeight: FontWeight.bold, color: TM.cyan)),
+          ),
+          ValueListenableBuilder<bool>(
+            valueListenable: s.aiDetrend,
+            builder: (_, v, __) => SwitchListTile(
+              title: Text(tr(ctx, 'Remove tilt before AI', 'إزالة الميل قبل التحليل')),
+              value: v,
+              onChanged: (x) => s.aiDetrend.value = x,
+            ),
+          ),
+          ValueListenableBuilder<bool>(
+            valueListenable: s.aiImageNet,
+            builder: (_, v, __) => SwitchListTile(
+              title: Text(tr(ctx, 'ImageNet normalisation', 'تطبيع ImageNet')),
+              subtitle: Text(tr(ctx, 'Try toggling if the model finds nothing', 'جرّب تغييره إن لم يكشف النموذج شيئًا')),
+              value: v,
+              onChanged: (x) => s.aiImageNet.value = x,
+            ),
+          ),
+          ValueListenableBuilder<double>(
+            valueListenable: s.aiConf,
+            builder: (_, v, __) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Text('${tr(ctx, 'AI confidence threshold', 'عتبة ثقة الذكاء')}: ${(v * 100).round()}%'),
+              ),
+              Slider(value: v, min: 0.05, max: 0.9, onChanged: (x) => s.aiConf.value = x),
             ]),
           ),
           ListTile(
@@ -1397,6 +1875,15 @@ Future<void> showGridSetup(BuildContext context) {
                   onSelectionChanged: (v) => set(() => sp = v.first),
                 ),
               ),
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  sp == 30
+                      ? tr(ctx, '30 cm: denser grid, better for small and medium targets.', '30 سم: شبكة أكثف، أفضل للأهداف الصغيرة والمتوسطة.')
+                      : tr(ctx, '40 cm: fewer points, faster, suited to large targets.', '40 سم: نقاط أقل وأسرع، مناسبة للأهداف الكبيرة.'),
+                  style: const TextStyle(color: TM.grey, fontSize: 12),
+                ),
+              ),
               label(tr(ctx, 'Points', 'عدد النقاط')),
               stepper(tr(ctx, 'Columns', 'أعمدة'), cols, (v) => cols = v),
               stepper(tr(ctx, 'Rows', 'صفوف'), rows, (v) => rows = v),
@@ -1519,7 +2006,8 @@ class _Center extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final d = s.deltaNt(v);
-    final alert = s.isAlert(v);
+    final st = s.alertState(v);
+    final alert = st != 0;
     return Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       Padding(padding: const EdgeInsets.fromLTRB(20, 12, 8, 12), child: ThermalBar(value: v)),
       Expanded(
@@ -1536,12 +2024,12 @@ class _Center extends StatelessWidget {
             duration: const Duration(milliseconds: 150),
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
             decoration: BoxDecoration(
-              color: alert ? TM.gold : Colors.transparent,
+              color: st > 0 ? TM.gold : (st < 0 ? TM.cyan : Colors.transparent),
               borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: alert ? TM.gold : Colors.white24),
+              border: Border.all(color: alert ? (st > 0 ? TM.gold : TM.cyan) : Colors.white24),
             ),
             child: Text(
-              alert ? tr(context, 'ANOMALY', 'شاذّة مغناطيسية') : tr(context, 'Normal', 'طبيعي'),
+              st > 0 ? tr(context, 'METAL', 'معدن') : (st < 0 ? tr(context, 'VOID', 'فراغ') : tr(context, 'Normal', 'طبيعي')),
               style: TextStyle(color: alert ? TM.navy : TM.grey, fontWeight: FontWeight.bold),
             ),
           ),
@@ -1741,6 +2229,7 @@ import 'package:flutter/services.dart';
 import '../ai/onnx_service.dart';
 import '../features/analysis_3d/grid_processor.dart';
 import 'ble/ble_service.dart';
+import 'tone_player.dart';
 
 /// App-wide singleton. Only the locale uses ChangeNotifier (root rebuild);
 /// everything that changes often uses ValueNotifier to keep rebuilds local.
@@ -1767,20 +2256,40 @@ class AppState extends ChangeNotifier {
   final ntPerCount = ValueNotifier<double>(1.0); // sensor scale factor
   final audioOn = ValueNotifier<bool>(true);
   final simulate = ValueNotifier<bool>(false);
+  final soil = ValueNotifier<int>(0); // index into soilTypes
+  final aiDetrend = ValueNotifier<bool>(true);
+  final aiImageNet = ValueNotifier<bool>(false);
+  final aiConf = ValueNotifier<double>(0.25);
+  final tone = TonePlayer();
 
   DateTime _lastBeep = DateTime.fromMillisecondsSinceEpoch(0);
 
   double deltaNt(int v) => baseline.value == null ? 0 : (v - baseline.value!) * ntPerCount.value;
-  bool isAlert(int v) => baseline.value != null && deltaNt(v).abs() > thresholdNt.value;
+  /// +1 = positive anomaly (metal), -1 = negative anomaly (void), 0 = normal.
+  int alertState(int v) {
+    if (baseline.value == null) return 0;
+    final d = deltaNt(v);
+    if (d > thresholdNt.value) return 1;
+    if (d < -thresholdNt.value) return -1;
+    return 0;
+  }
+
+  bool isAlert(int v) => alertState(v) != 0;
 
   void _onSample(SensorSample s) {
     live.value = s.value;
-    if (audioOn.value && isAlert(s.value)) {
+    final st = alertState(s.value);
+    if (st != 0 && audioOn.value) {
       final now = DateTime.now();
-      if (now.difference(_lastBeep).inMilliseconds > 250) {
+      if (now.difference(_lastBeep).inMilliseconds > 350) {
         _lastBeep = now;
-        SystemSound.play(SystemSoundType.click);
-        HapticFeedback.lightImpact();
+        if (st > 0) {
+          tone.metal();
+          HapticFeedback.heavyImpact();
+        } else {
+          tone.voidTone();
+          HapticFeedback.selectionClick();
+        }
       }
     }
   }
@@ -2106,6 +2615,66 @@ class ScanStore {
     return [for (final r in rows) [...r, ...List.filled(w - r.length, double.nan)]];
   }
 }
+=== FILE: lib/services/tone_player.dart ===
+import 'dart:math' as math;
+import 'dart:typed_data';
+import 'package:audioplayers/audioplayers.dart';
+
+/// Synthesised alert tones (no audio assets needed):
+/// metal = high double beep, void = low long tone.
+class TonePlayer {
+  final AudioPlayer _p = AudioPlayer();
+  late final Uint8List _metal = _wav([[1500, 0.09], [0, 0.05], [1500, 0.09]]);
+  late final Uint8List _void = _wav([[320, 0.30]]);
+
+  Future<void> metal() => _play(_metal);
+  Future<void> voidTone() => _play(_void);
+
+  Future<void> _play(Uint8List b) async {
+    try {
+      await _p.stop();
+      await _p.play(BytesSource(b));
+    } catch (_) {/* audio is best-effort */}
+  }
+
+  /// segments: [frequencyHz (0 = silence), seconds]. 16-bit mono PCM WAV, 22.05 kHz.
+  static Uint8List _wav(List<List<double>> segs) {
+    const rate = 22050;
+    final samples = <int>[];
+    for (final s in segs) {
+      final n = (s[1] * rate).round();
+      for (var i = 0; i < n; i++) {
+        final fade = math.min(1.0, math.min(i, n - i) / (rate * 0.008)); // click-free edges
+        final v = s[0] == 0 ? 0.0 : math.sin(2 * math.pi * s[0] * i / rate) * 0.8 * fade;
+        samples.add((v * 32767).round());
+      }
+    }
+    final data = ByteData(44 + samples.length * 2);
+    void str(int o, String t) {
+      for (var i = 0; i < t.length; i++) {
+        data.setUint8(o + i, t.codeUnitAt(i));
+      }
+    }
+
+    str(0, 'RIFF');
+    data.setUint32(4, 36 + samples.length * 2, Endian.little);
+    str(8, 'WAVE');
+    str(12, 'fmt ');
+    data.setUint32(16, 16, Endian.little);
+    data.setUint16(20, 1, Endian.little);
+    data.setUint16(22, 1, Endian.little);
+    data.setUint32(24, rate, Endian.little);
+    data.setUint32(28, rate * 2, Endian.little);
+    data.setUint16(32, 2, Endian.little);
+    data.setUint16(34, 16, Endian.little);
+    str(36, 'data');
+    data.setUint32(40, samples.length * 2, Endian.little);
+    for (var i = 0; i < samples.length; i++) {
+      data.setInt16(44 + i * 2, samples[i], Endian.little);
+    }
+    return data.buffer.asUint8List();
+  }
+}
 === FILE: lib/widgets/compass_widget.dart ===
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
@@ -2161,6 +2730,104 @@ class _CompassPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_CompassPainter o) => o.heading != heading;
+}
+=== FILE: lib/widgets/heatmap_painter.dart ===
+import 'dart:math' as math;
+import 'package:flutter/material.dart';
+import '../core/theme/app_theme.dart';
+import '../features/analysis_3d/grid_processor.dart';
+
+class HeatBox {
+  final Rect rect; // cell units of the drawn matrix
+  final String label;
+  final Color color;
+  const HeatBox(this.rect, this.label, this.color);
+}
+
+/// Flat 2-D heat-map with detection boxes and labels.
+class HeatmapPainter extends CustomPainter {
+  final List<List<double>> m;
+  final List<HeatBox> boxes;
+  HeatmapPainter(this.m, this.boxes);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rows = m.length, cols = m.first.length;
+    final flat = m.expand((r) => r).toList();
+    final stats = ScanStats(flat.reduce(math.min), flat.reduce((a, b) => a + b) / flat.length, flat.reduce(math.max));
+    final cell = math.min((size.width - 16) / cols, (size.height - 16) / rows);
+    final ox = (size.width - cell * cols) / 2, oy = (size.height - cell * rows) / 2;
+    final paint = Paint();
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        paint.color = jetRelativeColor(m[r][c], stats);
+        canvas.drawRect(Rect.fromLTWH(ox + c * cell, oy + r * cell, cell + 0.6, cell + 0.6), paint);
+      }
+    }
+    for (final b in boxes) {
+      final rc = Rect.fromLTRB(ox + b.rect.left * cell, oy + b.rect.top * cell, ox + b.rect.right * cell, oy + b.rect.bottom * cell);
+      canvas.drawRect(rc, Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.5
+        ..color = b.color);
+      final tp = TextPainter(
+        text: TextSpan(text: b.label, style: TextStyle(color: TM.navy, fontSize: 11, fontWeight: FontWeight.bold, backgroundColor: b.color)),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      tp.paint(canvas, Offset(rc.left, math.max(0, rc.top - tp.height)));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant HeatmapPainter old) => true;
+}
+
+/// Cross-section line chart (one row or column) with the normal level and the threshold band.
+class ProfilePainter extends CustomPainter {
+  final List<double> values;
+  final double normal, thr;
+  ProfilePainter(this.values, this.normal, this.thr);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const pad = 28.0;
+    final w = size.width - pad * 2, h = size.height - pad * 2;
+    var lo = values.reduce(math.min), hi = values.reduce(math.max);
+    lo = math.min(lo, normal - thr);
+    hi = math.max(hi, normal + thr);
+    final span = (hi - lo).abs() < 1e-9 ? 1.0 : hi - lo;
+    double y(double v) => pad + h - (v - lo) / span * h;
+    double x(int i) => pad + (values.length == 1 ? 0 : i / (values.length - 1)) * w;
+
+    canvas.drawRect(Rect.fromLTRB(pad, y(normal + thr), pad + w, y(normal - thr)), Paint()..color = TM.cyan.withOpacity(0.10));
+    canvas.drawLine(Offset(pad, y(normal)), Offset(pad + w, y(normal)), Paint()
+      ..color = TM.grey
+      ..strokeWidth = 1);
+    final path = Path();
+    for (var i = 0; i < values.length; i++) {
+      final p = Offset(x(i), y(values[i]));
+      i == 0 ? path.moveTo(p.dx, p.dy) : path.lineTo(p.dx, p.dy);
+    }
+    canvas.drawPath(path, Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.5
+      ..color = TM.cyan);
+    for (var i = 0; i < values.length; i++) {
+      final out = (values[i] - normal).abs() > thr;
+      canvas.drawCircle(Offset(x(i), y(values[i])), out ? 4.5 : 2.5, Paint()..color = out ? TM.gold : TM.cyan);
+    }
+    void label(String t, Offset o) {
+      final tp = TextPainter(text: TextSpan(text: t, style: const TextStyle(color: TM.grey, fontSize: 10)), textDirection: TextDirection.ltr)..layout();
+      tp.paint(canvas, o);
+    }
+
+    label('${hi.round()}', const Offset(2, pad - 6));
+    label('${lo.round()}', Offset(2, pad + h - 6));
+    label('normal ${normal.round()}', Offset(pad + 4, y(normal) - 13));
+  }
+
+  @override
+  bool shouldRepaint(covariant ProfilePainter old) => true;
 }
 === FILE: lib/widgets/iso_grid_painter.dart ===
 import 'dart:math' as math;
