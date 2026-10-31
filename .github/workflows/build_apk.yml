@@ -17,8 +17,10 @@ jobs:
       - name: Assemble sources and model
         run: |
           python3 - <<'PY'
-          import os, re
-          t = open('project_bundle.txt', encoding='utf-8').read()
+          import os, re, glob
+          c = glob.glob('**/project_bundle*', recursive=True)
+          print('found bundle:', c)
+          t = open(c[0], encoding='utf-8').read()
           parts = re.split(r'^=== FILE: (.+?) ===\n', t, flags=re.M)
           for i in range(1, len(parts), 2):
               path = 'app/' + parts[i]
@@ -26,7 +28,8 @@ jobs:
               open(path, 'w', encoding='utf-8').write(parts[i + 1])
           PY
           mkdir -p app/assets/models
-          cat model_part_* > app/assets/models/best2.onnx
+          find . -name 'model_part_*' | sort
+          cat $(find . -name 'model_part_*' | sort) > app/assets/models/best2.onnx
           ls -la app/assets/models
 
       - name: Create Android host project (keep our lib and pubspec)
@@ -54,6 +57,20 @@ jobs:
           open(p,"w").write(s[:i]+perms+s[i:])
           PY
           sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/; s/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' android/app/build.gradle* || true
+
+      # Some plugins (e.g. file_picker) are compiled against an older Android API than
+      # their own dependencies require. Force every module to compile against API 36.
+      - name: Force compileSdk 36 for all plugins
+        run: |
+          mkdir -p ~/.gradle
+          cat > ~/.gradle/init.gradle <<'GRADLE'
+          allprojects {
+              afterEvaluate { p ->
+                  def ext = p.extensions.findByName('android')
+                  if (ext != null) { ext.compileSdkVersion 36 }
+              }
+          }
+          GRADLE
 
       - name: Build
         working-directory: app
