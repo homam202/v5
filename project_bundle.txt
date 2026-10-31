@@ -1,0 +1,1044 @@
+=== FILE: pubspec.yaml ===
+name: terramag
+description: Fully offline magnetic gradiometer survey app (ESP32 + RM3100).
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  intl: ^0.19.0
+  flutter_blue_plus: ^1.32.0
+  flutter_onnxruntime: ^1.4.0     # check pub.dev for the latest version
+  sqflite: ^2.3.0
+  path_provider: ^2.1.0
+  path: ^1.9.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/best2.onnx
+=== FILE: lib/main.dart ===
+import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'core/theme/app_theme.dart';
+import 'features/analysis_3d/analysis_screen.dart';
+import 'features/connect/connect_screen.dart';
+import 'features/file_manager/file_manager_screen.dart';
+import 'features/live_scan/live_scan_screen.dart';
+import 'services/app_state.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const TerraMagApp());
+}
+
+class TerraMagApp extends StatelessWidget {
+  const TerraMagApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: AppState.I,
+      builder: (_, __) => MaterialApp(
+        title: 'TerraMag',
+        debugShowCheckedModeBanner: false,
+        theme: terraMagTheme(),
+        themeMode: ThemeMode.dark, // dark by default for field visibility
+        locale: AppState.I.locale, // Locale('ar') => automatic RTL
+        supportedLocales: const [Locale('en'), Locale('ar')],
+        localizationsDelegates: const [
+          GlobalMaterialLocalizations.delegate,
+          GlobalWidgetsLocalizations.delegate,
+          GlobalCupertinoLocalizations.delegate,
+        ],
+        home: const Shell(),
+      ),
+    );
+  }
+}
+
+class Shell extends StatefulWidget {
+  const Shell({super.key});
+  @override
+  State<Shell> createState() => _ShellState();
+}
+
+class _ShellState extends State<Shell> {
+  int _i = 0;
+  @override
+  Widget build(BuildContext context) {
+    final ar = Localizations.localeOf(context).languageCode == 'ar';
+    String t(String en, String arText) => ar ? arText : en;
+    return Scaffold(
+      body: IndexedStack(index: _i, children: const [
+        ConnectScreen(),
+        LiveScanScreen(),
+        AnalysisScreen(),
+        FileManagerScreen(),
+      ]),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _i,
+        onDestinationSelected: (v) => setState(() => _i = v),
+        destinations: [
+          NavigationDestination(icon: const Icon(Icons.bluetooth), label: t('Connect', 'اتصال')),
+          NavigationDestination(icon: const Icon(Icons.sensors), label: t('Live Scan', 'مسح مباشر')),
+          NavigationDestination(icon: const Icon(Icons.view_in_ar), label: t('3D/4D', 'تحليل 3D/4D')),
+          NavigationDestination(icon: const Icon(Icons.folder), label: t('Files', 'الملفات')),
+        ],
+      ),
+    );
+  }
+}
+=== FILE: lib/ai/heatmap_renderer.dart ===
+import 'dart:typed_data';
+import '../features/analysis_3d/grid_processor.dart' show ScanStats, jetRelative;
+
+/// Matrix (RAW sensor values, no NaN) -> YOLO tensor float32 NCHW [1,3,640,640], RGB 0..1.
+/// Pipeline: optional plane detrend -> bicubic upsampling -> data-relative Jet colours
+/// -> letterbox (grey 114/255), matching Ultralytics preprocessing.
+class HeatmapRenderer {
+  static const int size = 640;
+
+  static Float32List toTensor(List<List<double>> raw, {bool detrend = true}) {
+    var m = detrend ? removePlane(raw) : raw;
+    final rows = m.length, cols = m.first.length;
+
+    // Statistics AFTER detrending, because colours are relative to them.
+    final flat = m.expand((r) => r).toList();
+    final lo = flat.reduce((a, b) => a < b ? a : b);
+    final hi = flat.reduce((a, b) => a > b ? a : b);
+    final avg = flat.reduce((a, b) => a + b) / flat.length;
+    final stats = ScanStats(lo, avg, hi);
+
+    final scale = (size / cols) < (size / rows) ? size / cols : size / rows;
+    final w = (cols * scale).round(), h = (rows * scale).round();
+    final x0 = (size - w) ~/ 2, y0 = (size - h) ~/ 2;
+
+    const pad = 114 / 255.0;
+    final plane = size * size;
+    final out = Float32List(3 * plane)..fillRange(0, 3 * plane, pad);
+
+    for (var y = 0; y < h; y++) {
+      final fy = ((y + 0.5) / scale - 0.5).clamp(0.0, rows - 1.0);
+      for (var x = 0; x < w; x++) {
+        final fx = ((x + 0.5) / scale - 0.5).clamp(0.0, cols - 1.0);
+        final v = _bicubic(m, fy, fx).clamp(lo, hi); // clamp kills overshoot
+        final (r, g, b) = jetRelative(v, stats);
+        final p = (y0 + y) * size + (x0 + x);
+        out[p] = r;
+        out[plane + p] = g;
+        out[2 * plane + p] = b;
+      }
+    }
+    return out;
+  }
+
+  /// Least-squares plane z = a*x + b*y + c is subtracted (the mean is kept),
+  /// removing a uniform tilt/gradient so local anomalies stand out.
+  static List<List<double>> removePlane(List<List<double>> m) {
+    final rows = m.length, cols = m.first.length;
+    final xm = (cols - 1) / 2, ym = (rows - 1) / 2;
+    double mean = 0, sxz = 0, syz = 0, sxx = 0, syy = 0;
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        mean += m[r][c];
+      }
+    }
+    mean /= rows * cols;
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        final dx = c - xm, dy = r - ym, dz = m[r][c] - mean;
+        sxz += dx * dz; syz += dy * dz; sxx += dx * dx; syy += dy * dy;
+      }
+    }
+    final a = sxx == 0 ? 0.0 : sxz / sxx, b = syy == 0 ? 0.0 : syz / syy;
+    return [
+      for (var r = 0; r < rows; r++)
+        [for (var c = 0; c < cols; c++) m[r][c] - a * (c - xm) - b * (r - ym)]
+    ];
+  }
+
+  // Catmull-Rom cubic interpolation on a 4x4 neighbourhood.
+  static double _cr(double t, double p0, double p1, double p2, double p3) =>
+      0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t +
+          (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
+
+  static double _bicubic(List<List<double>> m, double fy, double fx) {
+    final rows = m.length, cols = m.first.length;
+    final iy = fy.floor(), ix = fx.floor();
+    final ty = fy - iy, tx = fx - ix;
+    final col = List<double>.filled(4, 0);
+    for (var j = -1; j <= 2; j++) {
+      final r = (iy + j).clamp(0, rows - 1);
+      double g(int dx) => m[r][(ix + dx).clamp(0, cols - 1)];
+      col[j + 1] = _cr(tx, g(-1), g(0), g(1), g(2));
+    }
+    return _cr(ty, col[0], col[1], col[2], col[3]);
+  }
+}
+=== FILE: lib/ai/onnx_service.dart ===
+import 'dart:math' as math;
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
+import 'heatmap_renderer.dart';
+
+/// One detected anomaly (box in 640x640 letterboxed pixel space).
+class Detection {
+  final int classId;
+  final String label;
+  final double confidence; // 0..1
+  final double x1, y1, x2, y2;
+  const Detection(this.classId, this.label, this.confidence, this.x1, this.y1, this.x2, this.y2);
+}
+
+class AiResult {
+  final List<Detection> detections; // after NMS, sorted by confidence
+  final Map<String, double> bestPerClass; // max confidence per class (for layer toggles)
+  const AiResult(this.detections, this.bestPerClass);
+  Detection? get top => detections.isEmpty ? null : detections.first;
+}
+
+class OnnxServiceException implements Exception {
+  final String message;
+  OnnxServiceException(this.message);
+  @override
+  String toString() => 'OnnxServiceException: $message';
+}
+
+/// Local inference for best2.onnx (Ultralytics YOLOv8 detect, 6 classes).
+///   input  'images'  float32 [1,3,640,640]  RGB 0..1
+///   output 'output0' float32 [1,10,8400]    rows 0-3 = cx,cy,w,h ; rows 4-9 = class scores
+///   (scores are already sigmoid-ed; NMS is NOT inside the graph)
+class OnnxService {
+  static const modelAsset = 'assets/models/best2.onnx';
+  static const inputName = 'images';
+  static const outputName = 'output0';
+  static const labels = ['soil', 'void', 'moisture', 'organic', 'rock', 'metal'];
+  static const numAnchors = 8400;
+
+  OrtSession? _session;
+  bool _busy = false;
+
+  bool get isReady => _session != null;
+
+  Future<void> init() async {
+    if (_session != null) return;
+    try {
+      _session = await OnnxRuntime().createSessionFromAsset(modelAsset);
+    } catch (e) {
+      throw OnnxServiceException('Failed to load model: $e');
+    }
+  }
+
+  /// [raw] = 2-D matrix of RAW sensor values without NaN (use GridProcessor.filled()).
+  /// Colours are computed relative to the survey's own min/avg/max inside HeatmapRenderer.
+  Future<AiResult> analyze(
+    List<List<double>> raw, {
+    double confThreshold = 0.25,
+    double iouThreshold = 0.45,
+  }) async {
+    if (_session == null) throw OnnxServiceException('Call init() first.');
+    if (_busy) throw OnnxServiceException('Inference already running.');
+    if (raw.isEmpty || raw.first.isEmpty) {
+      throw OnnxServiceException('Empty matrix.');
+    }
+    _busy = true;
+
+    OrtValue? input;
+    Map<String, OrtValue>? outputs;
+    try {
+      // a+b+c) detrend + bicubic + relative-Jet heatmap -> flat Float32List, NCHW order (heavy loop: run off the UI isolate)
+      final Float32List tensor = await compute(_buildTensor, raw);
+
+      // c) shape [1,3,640,640]
+      input = await OrtValue.fromList(tensor, [1, 3, HeatmapRenderer.size, HeatmapRenderer.size]);
+
+      // d) inference
+      outputs = await _session!.run({inputName: input});
+      final out = outputs[outputName];
+      if (out == null) throw OnnxServiceException('Missing output "$outputName".');
+
+      // e) read probabilities: flat length must be 10 * 8400
+      final raw = await out.asFlattenedList();
+      if (raw.length != (4 + labels.length) * numAnchors) {
+        throw OnnxServiceException('Unexpected output size ${raw.length}.');
+      }
+      final flat = Float32List.fromList(raw.map((e) => (e as num).toDouble()).toList());
+      return _decode(flat, confThreshold, iouThreshold);
+    } on OnnxServiceException {
+      rethrow;
+    } catch (e) {
+      throw OnnxServiceException('Inference failed: $e');
+    } finally {
+      // Always free native memory, even on error.
+      await input?.dispose();
+      if (outputs != null) {
+        for (final v in outputs.values) {
+          await v.dispose();
+        }
+      }
+      _busy = false;
+    }
+  }
+
+  Future<void> dispose() async {
+    await _session?.close();
+    _session = null;
+  }
+
+  // ---- helpers ---------------------------------------------------------
+  static Float32List _buildTensor(List<List<double>> m) => HeatmapRenderer.toTensor(m);
+
+  /// Output layout is channel-major: value(c, i) = flat[c * 8400 + i].
+  static AiResult _decode(Float32List f, double conf, double iou) {
+    final cand = <Detection>[];
+    final best = {for (final l in labels) l: 0.0};
+    for (var i = 0; i < numAnchors; i++) {
+      var cls = 0;
+      var score = f[4 * numAnchors + i];
+      for (var c = 1; c < labels.length; c++) {
+        final s = f[(4 + c) * numAnchors + i];
+        if (s > score) {
+          score = s;
+          cls = c;
+        }
+      }
+      if (score < conf) continue;
+      final cx = f[i], cy = f[numAnchors + i];
+      final w = f[2 * numAnchors + i], h = f[3 * numAnchors + i];
+      cand.add(Detection(cls, labels[cls], score, cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2));
+      if (score > best[labels[cls]]!) best[labels[cls]] = score;
+    }
+    return AiResult(_nms(cand, iou), best);
+  }
+
+  static List<Detection> _nms(List<Detection> d, double iouThr) {
+    d.sort((a, b) => b.confidence.compareTo(a.confidence));
+    final keep = <Detection>[];
+    for (final c in d) {
+      if (keep.every((k) => k.classId != c.classId || _iou(k, c) < iouThr)) keep.add(c);
+      if (keep.length >= 50) break;
+    }
+    return keep;
+  }
+
+  static double _iou(Detection a, Detection b) {
+    final ix = math.max(0.0, math.min(a.x2, b.x2) - math.max(a.x1, b.x1));
+    final iy = math.max(0.0, math.min(a.y2, b.y2) - math.max(a.y1, b.y1));
+    final inter = ix * iy;
+    final u = (a.x2 - a.x1) * (a.y2 - a.y1) + (b.x2 - b.x1) * (b.y2 - b.y1) - inter;
+    return u <= 0 ? 0 : inter / u;
+  }
+}
+=== FILE: lib/services/app_state.dart ===
+import 'package:flutter/material.dart';
+import '../ai/onnx_service.dart';
+import '../features/analysis_3d/grid_processor.dart';
+import 'ble/ble_service.dart';
+
+/// Tiny app-wide container (swap for Riverpod/Provider if you prefer).
+class AppState extends ChangeNotifier {
+  AppState._();
+  static final I = AppState._();
+
+  final ble = BleService();
+  final grid = GridProcessor(rows: 16, cols: 16, spacingCm: 30);
+  final onnx = OnnxService();
+
+  Locale locale = const Locale('en');
+  void toggleLocale() {
+    locale = locale.languageCode == 'en' ? const Locale('ar') : const Locale('en');
+    notifyListeners();
+  }
+}
+=== FILE: lib/services/ble/ble_service.dart ===
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:path_provider/path_provider.dart';
+
+/// One parsed sample from the ESP32.
+class SensorSample {
+  final int value; // 0..1023
+  final DateTime t;
+  SensorSample(this.value, this.t);
+}
+
+/// BLE link to the ESP32 gradiometer.
+/// Protocol: ASCII lines "0..1023\r\n". Optional "BAT:87\r\n" for battery.
+class BleService {
+  // Nordic UART Service defaults - change to match your ESP32 firmware.
+  static final Guid serviceUuid = Guid('6E400001-B5A3-F393-E0A9-E50E24DCCA9E');
+  static final Guid txCharUuid = Guid('6E400003-B5A3-F393-E0A9-E50E24DCCA9E'); // notify
+
+  final _samples = StreamController<SensorSample>.broadcast();
+  final _status = StreamController<BleStatus>.broadcast();
+  Stream<SensorSample> get samples => _samples.stream;
+  Stream<BleStatus> get status => _status.stream;
+
+  BluetoothDevice? _device;
+  StreamSubscription? _connSub, _dataSub;
+  String _buffer = '';
+  bool _wantConnected = false;
+  int _retry = 0;
+  int batteryPercent = -1;
+
+  // ---- scanning --------------------------------------------------------
+  Stream<List<ScanResult>> scan() {
+    FlutterBluePlus.startScan(
+      withServices: [serviceUuid],
+      timeout: const Duration(seconds: 8),
+    );
+    return FlutterBluePlus.scanResults;
+  }
+
+  // ---- connect / auto-reconnect ---------------------------------------
+  Future<void> connect(BluetoothDevice device) async {
+    _wantConnected = true;
+    _device = device;
+    await _saveLastDevice(device.remoteId.str);
+    await _openLink();
+  }
+
+  /// Call at app start: silently reconnects to the last paired device.
+  Future<void> autoConnectLast() async {
+    final id = await _loadLastDevice();
+    if (id == null) return;
+    await connect(BluetoothDevice.fromId(id));
+  }
+
+  Future<void> _openLink() async {
+    final d = _device;
+    if (d == null) return;
+    try {
+      _status.add(BleStatus.connecting);
+      await FlutterBluePlus.stopScan();
+      await d.connect(timeout: const Duration(seconds: 10), autoConnect: false);
+
+      // Watch the link; on drop -> exponential back-off reconnect.
+      await _connSub?.cancel();
+      _connSub = d.connectionState.listen((s) {
+        if (s == BluetoothConnectionState.disconnected && _wantConnected) {
+          _status.add(BleStatus.reconnecting);
+          _scheduleReconnect();
+        }
+      });
+
+      final services = await d.discoverServices();
+      final svc = services.firstWhere((s) => s.uuid == serviceUuid);
+      final ch = svc.characteristics.firstWhere((c) => c.uuid == txCharUuid);
+      await ch.setNotifyValue(true);
+
+      await _dataSub?.cancel();
+      _dataSub = ch.onValueReceived.listen(_onBytes);
+      d.cancelWhenDisconnected(_dataSub!);
+
+      _retry = 0;
+      _buffer = '';
+      _status.add(BleStatus.connected);
+    } catch (_) {
+      _status.add(BleStatus.reconnecting);
+      _scheduleReconnect();
+    }
+  }
+
+  void _scheduleReconnect() {
+    if (!_wantConnected) return;
+    final delay = Duration(seconds: (1 << _retry.clamp(0, 5))); // 1,2,4,..32 s
+    _retry++;
+    Timer(delay, () {
+      if (_wantConnected) _openLink();
+    });
+  }
+
+  Future<void> disconnect() async {
+    _wantConnected = false;
+    await _dataSub?.cancel();
+    await _connSub?.cancel();
+    await _device?.disconnect();
+    _status.add(BleStatus.disconnected);
+  }
+
+  // ---- parsing ---------------------------------------------------------
+  /// BLE packets may split or merge lines, so buffer until '\n'.
+  void _onBytes(List<int> bytes) {
+    _buffer += utf8.decode(bytes, allowMalformed: true);
+    int nl;
+    while ((nl = _buffer.indexOf('\n')) >= 0) {
+      final line = _buffer.substring(0, nl).trim();
+      _buffer = _buffer.substring(nl + 1);
+      if (line.isEmpty) continue;
+      if (line.startsWith('BAT:')) {
+        batteryPercent = int.tryParse(line.substring(4)) ?? batteryPercent;
+        continue;
+      }
+      final v = int.tryParse(line);
+      if (v != null && v >= 0 && v <= 1023) {
+        _samples.add(SensorSample(v, DateTime.now()));
+      } // anything else is silently ignored (noise / partial line)
+    }
+  }
+
+  // ---- last-device persistence (plain JSON file) ----------------------
+  Future<File> _cfg() async =>
+      File('${(await getApplicationSupportDirectory()).path}/last_device.json');
+  Future<void> _saveLastDevice(String id) async =>
+      (await _cfg()).writeAsString(jsonEncode({'id': id}));
+  Future<String?> _loadLastDevice() async {
+    final f = await _cfg();
+    if (!await f.exists()) return null;
+    return (jsonDecode(await f.readAsString()) as Map)['id'] as String?;
+  }
+
+  void dispose() {
+    _wantConnected = false;
+    _dataSub?.cancel();
+    _connSub?.cancel();
+    _samples.close();
+    _status.close();
+  }
+}
+
+enum BleStatus { disconnected, connecting, connected, reconnecting }
+=== FILE: lib/services/storage/survey_db.dart ===
+import 'dart:convert';
+import 'package:path/path.dart' as p;
+import 'package:sqflite/sqflite.dart';
+
+/// surveys(id, name, created_at, rows, cols, spacing_cm, matrix_json)
+class SurveyDb {
+  static Future<Database> open() async => openDatabase(
+        p.join(await getDatabasesPath(), 'terramag.db'),
+        version: 1,
+        onCreate: (db, _) => db.execute('''
+          CREATE TABLE surveys(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, created_at TEXT,
+            rows INTEGER, cols INTEGER, spacing_cm INTEGER, matrix_json TEXT)'''),
+      );
+
+  static Future<int> save(String name, List<List<double>> m, int spacingCm) async {
+    final db = await open();
+    return db.insert('surveys', {
+      'name': name,
+      'created_at': DateTime.now().toIso8601String(),
+      'rows': m.length, 'cols': m.first.length, 'spacing_cm': spacingCm,
+      // NaN is not valid JSON -> store unmeasured cells as null
+      'matrix_json': jsonEncode(m.map((r) => r.map((v) => v.isNaN ? null : v).toList()).toList()),
+    });
+  }
+}
+=== FILE: lib/features/file_manager/file_manager_screen.dart ===
+import 'package:flutter/material.dart';
+
+/// Lists saved surveys (SQLite `surveys` table + exported JSON files).
+/// See lib/services/storage/survey_db.dart for the schema.
+class FileManagerScreen extends StatelessWidget {
+  const FileManagerScreen({super.key});
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('File Manager')),
+        body: const Center(child: Text('Saved surveys appear here')),
+      );
+}
+=== FILE: lib/features/live_scan/live_scan_screen.dart ===
+import 'package:flutter/material.dart';
+import '../../core/theme/app_theme.dart';
+import '../../services/app_state.dart';
+import '../../services/ble/ble_service.dart';
+import '../../widgets/thermal_bar.dart';
+
+class LiveScanScreen extends StatefulWidget {
+  const LiveScanScreen({super.key});
+  @override
+  State<LiveScanScreen> createState() => _LiveScanScreenState();
+}
+
+class _LiveScanScreenState extends State<LiveScanScreen> with SingleTickerProviderStateMixin {
+  final s = AppState.I;
+  int _value = 0;
+  late final AnimationController _pulse =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 600))..repeat(reverse: true);
+
+  @override
+  void initState() {
+    super.initState();
+    s.ble.samples.listen((x) => setState(() => _value = x.value));
+  }
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: StreamBuilder<BleStatus>(
+        stream: s.ble.status,
+        builder: (_, st) => Row(children: [
+          Icon(Icons.bluetooth, color: st.data == BleStatus.connected ? TM.cyan : TM.grey),
+          const SizedBox(width: 8),
+          Text('${st.data?.name ?? 'disconnected'}'),
+          const Spacer(),
+          const Icon(Icons.battery_full, size: 20),
+          Text(s.ble.batteryPercent < 0 ? ' --' : ' ${s.ble.batteryPercent}%'),
+        ]),
+      )),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () {/* Smart Calibration: record ~2 s of samples, store mean as baseline offset */},
+        icon: const Icon(Icons.tune), label: const Text('Calibrate'),
+      ),
+      body: Column(children: [
+        Expanded(child: Center(child: Padding(padding: const EdgeInsets.all(24), child: ThermalBar(value: _value)))),
+        Text('$_value', style: Theme.of(context).textTheme.displayLarge),
+        const SizedBox(height: 16),
+        FadeTransition(
+          opacity: Tween(begin: 0.4, end: 1.0).animate(_pulse),
+          child: Icon(_value > 700 ? Icons.volume_up : Icons.volume_mute,
+              size: 40, color: _value > 700 ? TM.gold : TM.grey),
+        ),
+        const SizedBox(height: 90),
+      ]),
+    );
+  }
+}
+=== FILE: lib/features/connect/connect_screen.dart ===
+import 'package:flutter/material.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import '../../services/app_state.dart';
+
+class ConnectScreen extends StatefulWidget {
+  const ConnectScreen({super.key});
+  @override
+  State<ConnectScreen> createState() => _ConnectScreenState();
+}
+
+class _ConnectScreenState extends State<ConnectScreen> {
+  final ble = AppState.I.ble;
+  @override
+  void initState() {
+    super.initState();
+    ble.autoConnectLast(); // silent reconnect to the last paired device
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('TerraMag'), actions: [
+          IconButton(icon: const Icon(Icons.translate), onPressed: AppState.I.toggleLocale),
+        ]),
+        body: StreamBuilder<List<ScanResult>>(
+          stream: ble.scan(),
+          builder: (_, snap) => ListView(children: [
+            for (final r in snap.data ?? const <ScanResult>[])
+              ListTile(
+                leading: const Icon(Icons.bluetooth),
+                title: Text(r.device.platformName.isEmpty ? r.device.remoteId.str : r.device.platformName),
+                subtitle: Text('RSSI ${r.rssi}'),
+                onTap: () => ble.connect(r.device),
+              ),
+          ]),
+        ),
+      );
+}
+=== FILE: lib/features/analysis_3d/analysis_screen.dart ===
+import 'package:flutter/material.dart';
+import '../../ai/onnx_service.dart';
+import '../../services/app_state.dart';
+import 'grid_processor.dart';
+import '../../widgets/ai_overlay_card.dart';
+import '../../widgets/iso_grid_painter.dart';
+
+class AnalysisScreen extends StatefulWidget {
+  const AnalysisScreen({super.key});
+  @override
+  State<AnalysisScreen> createState() => _AnalysisScreenState();
+}
+
+class _AnalysisScreenState extends State<AnalysisScreen> {
+  final s = AppState.I;
+  double depth = 1, rot = 0.6;
+  bool volumetric = false, loading = false;
+  String? error;
+  AiResult? result;
+  // Layer visibility: Soil, Minerals(rock+organic), Moisture, Voids, Metals
+  final layers = {'soil': true, 'rock': true, 'moisture': true, 'void': true, 'metal': true};
+
+  Future<void> _runAi() async {
+    setState(() { loading = true; error = null; });
+    try {
+      await s.onnx.init();
+      result = await s.onnx.analyze(s.grid.filled());
+    } catch (e) {
+      error = e.toString();
+    }
+    if (mounted) setState(() => loading = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('3D / 4D Analysis'), actions: [
+        for (final e in layers.entries)
+          IconButton(
+            tooltip: e.key,
+            icon: Icon(e.value ? Icons.visibility : Icons.visibility_off),
+            onPressed: () => setState(() => layers[e.key] = !e.value),
+          ),
+      ]),
+      body: Stack(children: [
+        GestureDetector(
+          onPanUpdate: (d) => setState(() => rot += d.delta.dx * 0.01),
+          child: ListenableBuilder(
+            listenable: s.grid,
+            builder: (_, __) => CustomPaint(
+              size: Size.infinite,
+              painter: IsoGridPainter(s.grid.normalized(),
+                  depthSpacing: depth, volumetric: volumetric, rotation: rot,
+                  colorOf: (v) {
+                    final st = s.grid.stats; // same palette as the AI heat-map
+                    return jetRelativeColor(st.min + v * (st.max - st.min), st);
+                  }),
+            ),
+          ),
+        ),
+        Positioned(left: 12, right: 12, bottom: 8, child: Column(mainAxisSize: MainAxisSize.min, children: [
+          AiOverlayCard(result: result, loading: loading, error: error),
+          Row(children: [
+            const Icon(Icons.layers), 
+            Expanded(child: Slider(value: depth, min: 0.2, max: 2, onChanged: (v) => setState(() => depth = v))),
+            const Text('Volumetric'),
+            Switch(value: volumetric, onChanged: (v) => setState(() => volumetric = v)),
+          ]),
+        ])),
+      ]),
+      floatingActionButton: Padding(
+        padding: const EdgeInsets.only(bottom: 150),
+        child: FloatingActionButton(onPressed: _runAi, child: const Icon(Icons.psychology)),
+      ),
+    );
+  }
+}
+=== FILE: lib/features/analysis_3d/grid_processor.dart ===
+import 'package:flutter/material.dart';
+
+/// Converts the 1-D stream of readings into a 2-D matrix.
+/// The surveyor walks a grid with [spacingCm] (30 or 40) between points.
+/// [snake] = true for boustrophedon walking (row 0 left->right, row 1 right->left...).
+class GridProcessor extends ChangeNotifier {
+  int rows, cols;
+  int spacingCm;
+  bool snake;
+  late List<List<double>> matrix; // raw 0..1023, NaN = not yet measured
+  int _cursor = 0;
+
+  GridProcessor({required this.rows, required this.cols, this.spacingCm = 30, this.snake = true}) {
+    reset();
+  }
+
+  void reset() {
+    matrix = List.generate(rows, (_) => List.filled(cols, double.nan));
+    _cursor = 0;
+    notifyListeners();
+  }
+
+  void configure({int? rows, int? cols, int? spacingCm}) {
+    this.rows = rows ?? this.rows;
+    this.cols = cols ?? this.cols;
+    this.spacingCm = spacingCm ?? this.spacingCm;
+    reset();
+  }
+
+  double get widthMeters => (cols - 1) * spacingCm / 100;
+  double get heightMeters => (rows - 1) * spacingCm / 100;
+  bool get isComplete => _cursor >= rows * cols;
+
+  /// Call when the user confirms a station (or automatically per sample).
+  void addReading(int value) {
+    if (isComplete) return;
+    final r = _cursor ~/ cols;
+    var c = _cursor % cols;
+    if (snake && r.isOdd) c = cols - 1 - c;
+    matrix[r][c] = value.toDouble();
+    _cursor++;
+    notifyListeners();
+  }
+
+  /// min / average / max over measured cells (NaN ignored).
+  ScanStats get stats {
+    final v = matrix.expand((r) => r).where((x) => !x.isNaN).toList();
+    if (v.isEmpty) return const ScanStats(0, 511.5, 1023);
+    final lo = v.reduce((a, b) => a < b ? a : b);
+    final hi = v.reduce((a, b) => a > b ? a : b);
+    return ScanStats(lo, v.reduce((a, b) => a + b) / v.length, hi);
+  }
+
+  /// Raw matrix with unmeasured cells replaced by the average (input for the AI).
+  List<List<double>> filled() {
+    final avg = stats.avg;
+    return [for (final r in matrix) [for (final v in r) v.isNaN ? avg : v]];
+  }
+
+  /// Min-max normalised copy (0..1). Unmeasured cells -> 0.
+  /// Use fixedRange=true to normalise against the sensor range 0..1023 instead.
+  List<List<double>> normalized({bool fixedRange = false}) {
+    double lo = 0, hi = 1023;
+    if (!fixedRange) {
+      final vals = matrix.expand((r) => r).where((v) => !v.isNaN);
+      if (vals.isEmpty) return List.generate(rows, (_) => List.filled(cols, 0.0));
+      lo = vals.reduce((a, b) => a < b ? a : b);
+      hi = vals.reduce((a, b) => a > b ? a : b);
+    }
+    final span = (hi - lo).abs() < 1e-9 ? 1.0 : hi - lo;
+    return [
+      for (final row in matrix)
+        [for (final v in row) v.isNaN ? 0.0 : ((v - lo) / span).clamp(0.0, 1.0)]
+    ];
+  }
+}
+
+/// Value (0..1) -> colour. Grey -> Cyan -> Gold -> Red.
+Color magColor(double t) {
+  t = t.clamp(0.0, 1.0);
+  const stops = [
+    (0.00, Color(0xFF3A4457)),
+    (0.35, Color(0xFF00E5FF)),
+    (0.70, Color(0xFFFFC107)),
+    (1.00, Color(0xFFFF1744)),
+  ];
+  for (var i = 0; i < stops.length - 1; i++) {
+    final (a, ca) = stops[i];
+    final (b, cb) = stops[i + 1];
+    if (t <= b) return Color.lerp(ca, cb, (t - a) / (b - a))!;
+  }
+  return stops.last.$2;
+}
+
+/// Data-relative statistics of one survey.
+class ScanStats {
+  final double min, avg, max;
+  const ScanStats(this.min, this.avg, this.max);
+}
+
+/// Data-relative 5-anchor "Jet" palette (same logic the training images use):
+/// min=blue (void) -> (min+avg)/2=cyan (moisture) -> avg=green (soil)
+/// -> (avg+max)/2=yellow -> max=red (metal). Returns r,g,b in 0..1.
+(double, double, double) jetRelative(double v, ScanStats s) {
+  final a = [s.min, (s.min + s.avg) / 2, s.avg, (s.avg + s.max) / 2, s.max];
+  const cols = [
+    (0.0, 0.0, 1.0),
+    (0.0, 1.0, 1.0),
+    (0.0, 1.0, 0.0),
+    (1.0, 1.0, 0.0),
+    (1.0, 0.0, 0.0),
+  ];
+  if (v <= a.first) return cols.first;
+  if (v >= a.last) return cols.last;
+  for (var i = 1; i < a.length; i++) {
+    if (v < a[i]) {
+      final span = a[i] - a[i - 1];
+      final t = span <= 1e-9 ? 0.0 : (v - a[i - 1]) / span;
+      final (r0, g0, b0) = cols[i - 1];
+      final (r1, g1, b1) = cols[i];
+      return (r0 + (r1 - r0) * t, g0 + (g1 - g0) * t, b0 + (b1 - b0) * t);
+    }
+  }
+  return cols.last;
+}
+
+Color jetRelativeColor(double v, ScanStats s) {
+  final (r, g, b) = jetRelative(v, s);
+  return Color.fromRGBO((r * 255).round(), (g * 255).round(), (b * 255).round(), 1);
+}
+=== FILE: lib/core/theme/app_theme.dart ===
+import 'package:flutter/material.dart';
+
+/// TerraMag brand palette: Deep Navy (background), Cyan (waves), Gold (detections).
+class TM {
+  static const navy = Color(0xFF0A1628);
+  static const navySurface = Color(0xFF12223D);
+  static const cyan = Color(0xFF00E5FF);
+  static const gold = Color(0xFFFFC107);
+  static const hot = Color(0xFFFF1744);
+  static const grey = Color(0xFF8A94A6);
+}
+
+ThemeData terraMagTheme() {
+  final scheme = const ColorScheme.dark(
+    primary: TM.cyan,
+    secondary: TM.gold,
+    surface: TM.navySurface,
+    error: TM.hot,
+  );
+  return ThemeData(
+    useMaterial3: true,
+    colorScheme: scheme,
+    scaffoldBackgroundColor: TM.navy,
+    appBarTheme: const AppBarTheme(backgroundColor: TM.navy, elevation: 0),
+    navigationBarTheme: NavigationBarThemeData(
+      backgroundColor: TM.navySurface,
+      indicatorColor: TM.cyan.withOpacity(0.2),
+      labelTextStyle: WidgetStatePropertyAll(
+        const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+      ),
+    ),
+    cardTheme: CardThemeData(
+      color: TM.navySurface.withOpacity(0.92),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+    ),
+    // Large, high-contrast text for outdoor/sunlight use.
+    textTheme: const TextTheme(
+      displayLarge: TextStyle(fontSize: 96, fontWeight: FontWeight.w800, color: Colors.white),
+    ),
+  );
+}
+=== FILE: lib/widgets/ai_overlay_card.dart ===
+import 'package:flutter/material.dart';
+import '../ai/onnx_service.dart';
+import '../core/theme/app_theme.dart';
+
+class AiOverlayCard extends StatelessWidget {
+  final AiResult? result;
+  final bool loading;
+  final String? error;
+  const AiOverlayCard({super.key, this.result, this.loading = false, this.error});
+
+  @override
+  Widget build(BuildContext context) {
+    final top = result?.top;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: loading
+            ? const LinearProgressIndicator()
+            : error != null
+                ? Text(error!, style: const TextStyle(color: TM.hot))
+                : top == null
+                    ? const Text('No anomaly detected')
+                    : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text(
+                          'Target: ${top.label[0].toUpperCase()}${top.label.substring(1)} '
+                          '(${(top.confidence * 100).round()}%)',
+                          style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: TM.gold),
+                        ),
+                        const SizedBox(height: 8),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: LinearProgressIndicator(
+                            value: top.confidence, minHeight: 10,
+                            color: TM.gold, backgroundColor: Colors.white12),
+                        ),
+                      ]),
+      ),
+    );
+  }
+}
+=== FILE: lib/widgets/iso_grid_painter.dart ===
+import 'dart:math' as math;
+import 'package:flutter/material.dart';
+import '../features/analysis_3d/grid_processor.dart';
+
+/// Lightweight isometric voxel view (no 3D engine needed).
+/// [matrix] normalised 0..1; [depthSpacing] scales bar height;
+/// [volumetric] = true -> translucent cells so deep anomalies show through.
+class IsoGridPainter extends CustomPainter {
+  final List<List<double>> matrix;
+  final double depthSpacing; // 0.2 .. 2.0
+  final bool volumetric;
+  final double rotation; // radians, driven by a drag gesture
+  final Color Function(double)? colorOf; // value 0..1 -> colour (defaults to magColor)
+  IsoGridPainter(this.matrix,
+      {this.depthSpacing = 1, this.volumetric = false, this.rotation = 0.6, this.colorOf});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rows = matrix.length, cols = matrix.first.length;
+    final cell = math.min(size.width, size.height) / (rows + cols) * 1.4;
+    final origin = Offset(size.width / 2, size.height * 0.25);
+    final cr = math.cos(rotation), sr = math.sin(rotation);
+
+    Offset proj(double x, double y, double z) {
+      final rx = x * cr - y * sr, ry = x * sr + y * cr; // rotate about vertical axis
+      return origin + Offset((rx - ry) * cell * 0.87, (rx + ry) * cell * 0.5 - z);
+    }
+
+    // Painter's algorithm: draw far cells first.
+    final order = <(int, int, double)>[
+      for (var r = 0; r < rows; r++)
+        for (var c = 0; c < cols; c++)
+          (r, c, (c - cols / 2) * sr + (r - rows / 2) * cr + (c - cols / 2) * cr)
+    ]..sort((a, b) => a.$3.compareTo(b.$3));
+
+    for (final (r, c, _) in order) {
+      final v = matrix[r][c];
+      final h = (v * cell * 4 * depthSpacing).clamp(1.0, 400.0);
+      final x = c - cols / 2, y = r - rows / 2;
+      final base = (colorOf ?? magColor)(v).withOpacity(volumetric ? 0.35 : 1);
+      final top = [proj(x, y, h), proj(x + 1, y, h), proj(x + 1, y + 1, h), proj(x, y + 1, h)];
+      final side = [proj(x + 1, y, h), proj(x + 1, y + 1, h), proj(x + 1, y + 1, 0), proj(x + 1, y, 0)];
+      _poly(canvas, side, Color.lerp(base, Colors.black, 0.35)!);
+      _poly(canvas, top, base);
+    }
+  }
+
+  void _poly(Canvas canvas, List<Offset> p, Color color) {
+    final path = Path()..addPolygon(p, true);
+    canvas.drawPath(path, Paint()..color = color);
+    canvas.drawPath(path, Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.5
+      ..color = Colors.black26);
+  }
+
+  @override
+  bool shouldRepaint(IsoGridPainter o) => true;
+}
+=== FILE: lib/widgets/thermal_bar.dart ===
+import 'package:flutter/material.dart';
+import '../core/theme/app_theme.dart';
+
+/// Large animated vertical bar, Grey -> Red, value 0..1023.
+class ThermalBar extends StatelessWidget {
+  final int value;
+  const ThermalBar({super.key, required this.value});
+  @override
+  Widget build(BuildContext context) {
+    final t = (value / 1023).clamp(0.0, 1.0);
+    return LayoutBuilder(builder: (_, c) {
+      return Container(
+        width: 72,
+        height: c.maxHeight,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(36),
+          border: Border.all(color: Colors.white24, width: 2),
+          gradient: const LinearGradient(
+            begin: Alignment.bottomCenter,
+            end: Alignment.topCenter,
+            colors: [TM.grey, Color(0xFFFFC107), TM.hot],
+          ),
+        ),
+        child: Stack(children: [
+          // Dim everything above the current level.
+          AnimatedPositioned(
+            duration: const Duration(milliseconds: 150),
+            top: 0, left: 0, right: 0,
+            height: c.maxHeight * (1 - t),
+            child: Container(
+              decoration: BoxDecoration(
+                color: TM.navy.withOpacity(0.85),
+                borderRadius: BorderRadius.circular(36),
+              ),
+            ),
+          ),
+        ]),
+      );
+    });
+  }
+}
