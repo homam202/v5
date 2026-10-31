@@ -12,9 +12,8 @@ dependencies:
     sdk: flutter
   flutter_localizations:
     sdk: flutter
-  intl: ^0.19.0
   flutter_blue_plus: ^1.32.0
-  flutter_onnxruntime: ^1.4.0     # check pub.dev for the latest version
+  flutter_onnxruntime: any
   sqflite: ^2.3.0
   path_provider: ^2.1.0
   path: ^1.9.0
@@ -265,11 +264,11 @@ class OnnxService {
       if (out == null) throw OnnxServiceException('Missing output "$outputName".');
 
       // e) read probabilities: flat length must be 10 * 8400
-      final raw = await out.asFlattenedList();
-      if (raw.length != (4 + labels.length) * numAnchors) {
-        throw OnnxServiceException('Unexpected output size ${raw.length}.');
+      final rawOut = await out.asFlattenedList();
+      if (rawOut.length != (4 + labels.length) * numAnchors) {
+        throw OnnxServiceException('Unexpected output size ${rawOut.length}.');
       }
-      final flat = Float32List.fromList(raw.map((e) => (e as num).toDouble()).toList());
+      final flat = Float32List.fromList(rawOut.map((e) => (e as num).toDouble()).toList());
       return _decode(flat, confThreshold, iouThreshold);
     } on OnnxServiceException {
       rethrow;
@@ -623,6 +622,7 @@ class ConnectScreen extends StatefulWidget {
 
 class _ConnectScreenState extends State<ConnectScreen> {
   final ble = AppState.I.ble;
+  late final Stream<List<ScanResult>> _scan = ble.scan();
   @override
   void initState() {
     super.initState();
@@ -635,7 +635,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
           IconButton(icon: const Icon(Icons.translate), onPressed: AppState.I.toggleLocale),
         ]),
         body: StreamBuilder<List<ScanResult>>(
-          stream: ble.scan(),
+          stream: _scan,
           builder: (_, snap) => ListView(children: [
             for (final r in snap.data ?? const <ScanResult>[])
               ListTile(
