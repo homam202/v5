@@ -284,6 +284,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
+import '../services/crash_guard.dart';
 import 'heatmap_renderer.dart';
 
 /// One detected anomaly (box in 640x640 letterboxed pixel space).
@@ -297,8 +298,10 @@ class Detection {
 
 class AiResult {
   final List<Detection> detections; // after NMS, sorted by confidence
-  final Map<String, double> bestPerClass; // max confidence per class (for layer toggles)
-  const AiResult(this.detections, this.bestPerClass);
+  final Map<String, double> bestPerClass; // best score per class, over ALL anchors (before threshold)
+  final double maxScore; // highest class score anywhere: tells "ran, nothing found" from "broken"
+  final int millis; // inference time
+  const AiResult(this.detections, this.bestPerClass, {this.maxScore = 0, this.millis = 0});
   Detection? get top => detections.isEmpty ? null : detections.first;
 }
 
@@ -310,32 +313,36 @@ class OnnxServiceException implements Exception {
 }
 
 /// Local inference for best2.onnx (Ultralytics YOLOv8 detect, 6 classes).
-///   input  'images'  float32 [1,3,640,640]  RGB 0..1
-///   output 'output0' float32 [1,10,8400]    rows 0-3 = cx,cy,w,h ; rows 4-9 = class scores
-///   (scores are already sigmoid-ed; NMS is NOT inside the graph)
+///   input  'images'  float32 [1,3,640,640]  RGB 0..1, NCHW
+///   output 'output0' float32 [1,10,8400]    channel-major: value(c, i) = flat[c * 8400 + i]
+///                    c 0-3 = cx,cy,w,h (640-px letterbox space), c 4-9 = class scores (already sigmoid)
+///   NMS is NOT inside the graph, so it is done here.
 class OnnxService {
   static const modelAsset = 'assets/models/best2.onnx';
   static const inputName = 'images';
   static const outputName = 'output0';
   static const labels = ['soil', 'void', 'moisture', 'organic', 'rock', 'metal'];
   static const numAnchors = 8400;
+  static const size = HeatmapRenderer.size; // 640
+  static const _maxCandidates = 300; // cap before NMS (keeps NMS fast)
 
   OrtSession? _session;
   bool _busy = false;
-
   bool get isReady => _session != null;
 
   Future<void> init() async {
     if (_session != null) return;
     try {
+      await CrashGuard.mark('init: createSession');
       _session = await OnnxRuntime().createSessionFromAsset(modelAsset);
+      await CrashGuard.mark('done');
     } catch (e) {
+      await CrashGuard.mark('done');
       throw OnnxServiceException('Failed to load model: $e');
     }
   }
 
-  /// [raw] = 2-D matrix of RAW sensor values without NaN (use GridProcessor.filled()).
-  /// Colours are computed relative to the survey's own min/avg/max inside HeatmapRenderer.
+  /// [raw] = 2-D matrix of RAW sensor values without NaN (GridProcessor.filled()).
   Future<AiResult> analyze(
     List<List<double>> raw, {
     double confThreshold = 0.25,
@@ -345,44 +352,68 @@ class OnnxService {
   }) async {
     if (_session == null) throw OnnxServiceException('Call init() first.');
     if (_busy) throw OnnxServiceException('Inference already running.');
-    if (raw.isEmpty || raw.first.isEmpty) {
-      throw OnnxServiceException('Empty matrix.');
-    }
+    if (raw.isEmpty || raw.first.isEmpty) throw OnnxServiceException('Empty matrix.');
     _busy = true;
 
+    final sw = Stopwatch()..start();
     OrtValue? input;
     Map<String, OrtValue>? outputs;
     try {
-      // a+b+c) detrend + bicubic + relative-Jet heatmap -> flat Float32List, NCHW order (heavy loop: run off the UI isolate)
+      // 1) matrix -> heat-map -> flat Float32List, NCHW (heavy loop: off the UI isolate)
+      await CrashGuard.mark('infer: buildTensor');
       final Float32List tensor = await compute(_buildTensor, (raw, detrend, imagenet));
-
-      // c) shape [1,3,640,640]
-      input = await OrtValue.fromList(tensor, [1, 3, HeatmapRenderer.size, HeatmapRenderer.size]);
-
-      // d) inference
-      outputs = await _session!.run({inputName: input});
-      final out = outputs[outputName];
-      if (out == null) throw OnnxServiceException('Missing output "$outputName".');
-
-      // e) read probabilities: flat length must be 10 * 8400
-      final rawOut = await out.asFlattenedList();
-      if (rawOut.length != (4 + labels.length) * numAnchors) {
-        throw OnnxServiceException('Unexpected output size ${rawOut.length}.');
+      const expected = 1 * 3 * size * size;
+      if (tensor.length != expected) {
+        throw OnnxServiceException('Tensor length ${tensor.length}, expected $expected.');
       }
-      final flat = Float32List.fromList(rawOut.map((e) => (e as num).toDouble()).toList());
-      return _decode(flat, confThreshold, iouThreshold);
+      for (var i = 0; i < tensor.length; i += 997) {
+        if (!tensor[i].isFinite) throw OnnxServiceException('Tensor contains NaN/Inf.');
+      }
+
+      // 2) shape [1,3,640,640]
+      await CrashGuard.mark('infer: createInputValue');
+      input = await OrtValue.fromList(tensor, [1, 3, size, size]);
+
+      // 3) run
+      await CrashGuard.mark('infer: session.run');
+      outputs = await _session!.run({inputName: input});
+      final out = outputs[outputName] ?? (outputs.isEmpty ? null : outputs.values.first);
+      if (out == null) throw OnnxServiceException('Model returned no outputs.');
+
+      // 4) read: flatten whatever nesting the plugin returns, convert safely to double
+      await CrashGuard.mark('infer: readOutput');
+      final rawOut = await out.asFlattenedList();
+      const want = (4 + 6) * numAnchors;
+      if (rawOut.length != want) {
+        throw OnnxServiceException('Unexpected output size ${rawOut.length} (expected $want).');
+      }
+      final flat = Float32List(want);
+      for (var i = 0; i < want; i++) {
+        final e = rawOut[i];
+        flat[i] = e is num ? e.toDouble() : double.tryParse('$e') ?? double.nan;
+      }
+
+      // 5) decode + NMS
+      await CrashGuard.mark('infer: decode');
+      final res = _decode(flat, confThreshold, iouThreshold, sw.elapsedMilliseconds);
+      await CrashGuard.mark('done');
+      return res;
     } on OnnxServiceException {
       rethrow;
     } catch (e) {
       throw OnnxServiceException('Inference failed: $e');
     } finally {
       // Always free native memory, even on error.
-      await input?.dispose();
-      if (outputs != null) {
-        for (final v in outputs.values) {
-          await v.dispose();
+      await CrashGuard.mark('infer: dispose');
+      try {
+        await input?.dispose();
+        if (outputs != null) {
+          for (final v in outputs.values) {
+            await v.dispose();
+          }
         }
-      }
+      } catch (_) {}
+      await CrashGuard.mark('done');
       _busy = false;
     }
   }
@@ -396,10 +427,10 @@ class OnnxService {
   static Float32List _buildTensor((List<List<double>>, bool, bool) a) =>
       HeatmapRenderer.toTensor(a.$1, detrend: a.$2, imagenet: a.$3);
 
-  /// Output layout is channel-major: value(c, i) = flat[c * 8400 + i].
-  static AiResult _decode(Float32List f, double conf, double iou) {
+  static AiResult _decode(Float32List f, double conf, double iou, int ms) {
     final cand = <Detection>[];
     final best = {for (final l in labels) l: 0.0};
+    var maxScore = 0.0;
     for (var i = 0; i < numAnchors; i++) {
       var cls = 0;
       var score = f[4 * numAnchors + i];
@@ -410,17 +441,21 @@ class OnnxService {
           cls = c;
         }
       }
+      if (score.isNaN) continue;
+      if (score > maxScore) maxScore = score;
+      if (score > best[labels[cls]]!) best[labels[cls]] = score;
       if (score < conf) continue;
       final cx = f[i], cy = f[numAnchors + i];
       final w = f[2 * numAnchors + i], h = f[3 * numAnchors + i];
       cand.add(Detection(cls, labels[cls], score, cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2));
-      if (score > best[labels[cls]]!) best[labels[cls]] = score;
     }
-    return AiResult(_nms(cand, iou), best);
+    cand.sort((a, b) => b.confidence.compareTo(a.confidence));
+    final top = cand.length > _maxCandidates ? cand.sublist(0, _maxCandidates) : cand;
+    return AiResult(_nms(top, iou), best, maxScore: maxScore, millis: ms);
   }
 
+  /// Per-class greedy NMS (input already sorted by confidence).
   static List<Detection> _nms(List<Detection> d, double iouThr) {
-    d.sort((a, b) => b.confidence.compareTo(a.confidence));
     final keep = <Detection>[];
     for (final c in d) {
       if (keep.every((k) => k.classId != c.classId || _iou(k, c) < iouThr)) keep.add(c);
@@ -547,18 +582,26 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
   List<Finding>? findings;
   bool onnxOk = false;
   String? onnxError;
+  String? onnxInfo;
 
   Future<void> _runAi() async {
     setState(() => loading = true);
     final raw = s.grid.filled();
     dynamic yolo;
     String? err;
-    try {
-      await s.onnx.init();
-      yolo = await s.onnx.analyze(raw,
-          confThreshold: s.aiConf.value, detrend: s.aiDetrend.value, imagenet: s.aiImageNet.value);
-    } catch (e) {
-      err = e.toString();
+    if (!s.aiEnabled.value) {
+      err = s.crashStage.value != null
+          ? 'The neural model crashed the app last time (stage: ${s.crashStage.value}). '
+              'It is switched off; rule-based detection is used.'
+          : 'Neural model is switched off in Settings; rule-based detection is used.';
+    } else {
+      try {
+        await s.onnx.init();
+        yolo = await s.onnx.analyze(raw,
+            confThreshold: s.aiConf.value, detrend: s.aiDetrend.value, imagenet: s.aiImageNet.value);
+      } catch (e) {
+        err = e.toString();
+      }
     }
     final f = buildFindings(
       m: raw,
@@ -572,6 +615,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
       findings = f;
       onnxOk = yolo != null;
       onnxError = err;
+      onnxInfo = yolo == null ? null : 'max ${(yolo.maxScore * 100).round()}% • ${yolo.millis} ms';
       loading = false;
     });
   }
@@ -616,6 +660,31 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
           final noRot = filters.rotation % 4 == 0;
           final fl = noRot ? (findings ?? const <Finding>[]) : const <Finding>[];
           return Column(children: [
+            ValueListenableBuilder<String?>(
+              valueListenable: s.crashStage,
+              builder: (_, st, __) => st == null
+                  ? const SizedBox.shrink()
+                  : MaterialBanner(
+                      backgroundColor: TM.navySurface,
+                      leading: const Icon(Icons.warning_amber, color: TM.gold),
+                      content: Text(tr(context,
+                          'The AI model crashed last time at: $st. Rule-based detection is on.',
+                          'انهار نموذج الذكاء آخر مرة عند: $st. الكشف بالقواعد مفعّل.')),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Clipboard.setData(ClipboardData(text: 'AI crash stage: $st')),
+                          child: Text(tr(context, 'Copy', 'نسخ')),
+                        ),
+                        TextButton(
+                          onPressed: () {
+                            s.aiEnabled.value = true;
+                            s.crashStage.value = null;
+                          },
+                          child: Text(tr(context, 'Try again', 'حاول مجددًا')),
+                        ),
+                      ],
+                    ),
+            ),
             Expanded(
               child: Stack(children: [
                 _body(context, m, factor, fl),
@@ -782,7 +851,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
                 onTap: onnxError == null ? null : () => _showError(context),
                 child: Text(
                   onnxOk
-                      ? tr(context, 'AI model + rules', 'نموذج الذكاء + القواعد')
+                      ? '${tr(context, 'AI model + rules', 'نموذج الذكاء + القواعد')}${onnxInfo == null ? '' : '\n$onnxInfo'}'
                       : tr(context, 'Rules only (tap: error)', 'القواعد فقط (اضغط للخطأ)'),
                   style: TextStyle(fontSize: 11, color: onnxOk ? TM.grey : TM.gold),
                 ),
@@ -1516,6 +1585,18 @@ void showSettingsSheet(BuildContext context) {
             child: Text(tr(ctx, 'AI options', 'خيارات الذكاء الاصطناعي'), style: const TextStyle(fontWeight: FontWeight.bold, color: TM.cyan)),
           ),
           ValueListenableBuilder<bool>(
+            valueListenable: s.aiEnabled,
+            builder: (_, v, __) => SwitchListTile(
+              title: Text(tr(ctx, 'Use neural model (ONNX)', 'استخدام نموذج الذكاء (ONNX)')),
+              subtitle: Text(tr(ctx, 'Off = rule-based detection only', 'مطفأ = الكشف بالقواعد فقط')),
+              value: v,
+              onChanged: (x) {
+                s.aiEnabled.value = x;
+                if (x) s.crashStage.value = null;
+              },
+            ),
+          ),
+          ValueListenableBuilder<bool>(
             valueListenable: s.aiDetrend,
             builder: (_, v, __) => SwitchListTile(
               title: Text(tr(ctx, 'Remove tilt before AI', 'إزالة الميل قبل التحليل')),
@@ -2229,6 +2310,7 @@ import 'package:flutter/services.dart';
 import '../ai/onnx_service.dart';
 import '../features/analysis_3d/grid_processor.dart';
 import 'ble/ble_service.dart';
+import 'crash_guard.dart';
 import 'tone_player.dart';
 
 /// App-wide singleton. Only the locale uses ChangeNotifier (root rebuild);
@@ -2236,6 +2318,17 @@ import 'tone_player.dart';
 class AppState extends ChangeNotifier {
   AppState._() {
     ble.samples.listen(_onSample);
+    _checkCrash();
+  }
+
+  /// If the last AI run died natively, switch the neural model off and remember where.
+  Future<void> _checkCrash() async {
+    final st = await CrashGuard.previousCrashStage();
+    if (st != null) {
+      aiEnabled.value = false;
+      crashStage.value = st;
+      await CrashGuard.mark('done');
+    }
   }
   static final I = AppState._();
 
@@ -2257,6 +2350,8 @@ class AppState extends ChangeNotifier {
   final audioOn = ValueNotifier<bool>(true);
   final simulate = ValueNotifier<bool>(false);
   final soil = ValueNotifier<int>(0); // index into soilTypes
+  final aiEnabled = ValueNotifier<bool>(true);
+  final crashStage = ValueNotifier<String?>(null);
   final aiDetrend = ValueNotifier<bool>(true);
   final aiImageNet = ValueNotifier<bool>(false);
   final aiConf = ValueNotifier<double>(0.25);
@@ -2487,6 +2582,35 @@ class BleService {
     } catch (_) {
       return null;
     }
+  }
+}
+=== FILE: lib/services/crash_guard.dart ===
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
+
+/// Native crashes cannot be caught in Dart. Before every risky native step we write its
+/// name to a file; if the app dies, the next launch reads the last stage that never finished.
+class CrashGuard {
+  static File? _f;
+  static Future<File> _file() async =>
+      _f ??= File('${(await getApplicationSupportDirectory()).path}/ai_stage.txt');
+
+  /// Stage of a previous run that did not finish (null = clean).
+  static Future<String?> previousCrashStage() async {
+    try {
+      final f = await _file();
+      if (!await f.exists()) return null;
+      final t = (await f.readAsString()).trim();
+      return (t.isEmpty || t == 'done') ? null : t;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> mark(String stage) async {
+    try {
+      await (await _file()).writeAsString(stage, flush: true);
+    } catch (_) {}
   }
 }
 === FILE: lib/services/storage/scan_store.dart ===
