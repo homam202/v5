@@ -583,6 +583,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
   bool onnxOk = false;
   String? onnxError;
   String? onnxInfo;
+  bool aiExpanded = true;
 
   Future<void> _runAi() async {
     setState(() => loading = true);
@@ -706,7 +707,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
       case 1:
         return CustomPaint(
           size: Size.infinite,
-          painter: HeatmapPainter(m, [
+          painter: HeatmapPainter(Directionality.of(context) == TextDirection.rtl, m, [
             for (final f in fl)
               HeatBox(
                 Rect.fromLTRB(f.c0 * factor, f.r0 * factor, f.c1 * factor, f.r1 * factor),
@@ -839,10 +840,16 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
           const Icon(Icons.psychology, color: TM.cyan),
           const SizedBox(width: 6),
           Expanded(child: Text(tr(context, 'AI Result', 'نتيجة الذكاء'), style: const TextStyle(fontWeight: FontWeight.bold))),
+          InkWell(
+            onTap: () => setState(() => aiExpanded = !aiExpanded),
+            child: Icon(aiExpanded ? Icons.unfold_less : Icons.unfold_more, size: 20, color: TM.grey),
+          ),
         ]),
         const SizedBox(height: 6),
         if (loading) const LinearProgressIndicator(),
-        if (fl != null && !loading) ...[
+        if (!aiExpanded && fl != null)
+          Text('${fl.length} ${tr(context, 'detections', 'كشوفات')}', style: const TextStyle(color: TM.gold)),
+        if (aiExpanded && fl != null && !loading) ...[
           Row(children: [
             Icon(onnxOk ? Icons.check_circle : Icons.error_outline, size: 14, color: onnxOk ? TM.cyan : TM.gold),
             const SizedBox(width: 4),
@@ -870,7 +877,8 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
             ),
           ],
         ],
-        const SizedBox(height: 2),
+        if (aiExpanded) const SizedBox(height: 2),
+        if (aiExpanded)
         Row(children: [
           Expanded(
             child: FilledButton.icon(
@@ -927,7 +935,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
                 subtitle: Text(
                   '${tr(ctx, 'Size', 'الحجم')}: ${f.widthCm.round()}×${f.lengthCm.round()} cm\n'
                   '${tr(ctx, 'Est. depth', 'العمق التقريبي')}: ${f.depthM.toStringAsFixed(2)} m  '
-                  '(${soilTypes[s.soil.value].en})\n'
+                  '(${tr(ctx, soilTypes[s.soil.value].en, soilTypes[s.soil.value].ar)})\n'
                   '${tr(ctx, 'Source', 'المصدر')}: ${f.source == 'AI' ? tr(ctx, 'AI model', 'نموذج الذكاء') : tr(ctx, 'Rule-based', 'قواعد')}',
                 ),
                 isThreeLine: true,
@@ -989,7 +997,9 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
         borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
       ),
       child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Row(children: [
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: Row(children: [
           Text('${st.min.round()}', style: const TextStyle(fontSize: 11, color: TM.grey)),
           const SizedBox(width: 6),
           Expanded(
@@ -1005,7 +1015,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
           ),
           const SizedBox(width: 6),
           Text('${st.max.round()}', style: const TextStyle(fontSize: 11, color: TM.grey)),
-        ]),
+        ])),
         const SizedBox(height: 6),
         Row(children: [
           Expanded(
@@ -2870,9 +2880,10 @@ class HeatBox {
 
 /// Flat 2-D heat-map with detection boxes and labels.
 class HeatmapPainter extends CustomPainter {
+  final bool rtl;
   final List<List<double>> m;
   final List<HeatBox> boxes;
-  HeatmapPainter(this.m, this.boxes);
+  HeatmapPainter(this.rtl, this.m, this.boxes);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -2896,7 +2907,7 @@ class HeatmapPainter extends CustomPainter {
         ..color = b.color);
       final tp = TextPainter(
         text: TextSpan(text: b.label, style: TextStyle(color: TM.navy, fontSize: 11, fontWeight: FontWeight.bold, backgroundColor: b.color)),
-        textDirection: TextDirection.ltr,
+        textDirection: rtl ? TextDirection.rtl : TextDirection.ltr,
       )..layout();
       tp.paint(canvas, Offset(rc.left, math.max(0, rc.top - tp.height)));
     }
