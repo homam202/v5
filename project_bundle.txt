@@ -32,17 +32,19 @@ import 'onnx_service.dart';
 
 enum Verdict { realMetal, possibleMetal, realVoid, possibleVoid, looseSoil, reliable, possible, uncertain }
 
-/// One detected target (from the YOLO model and/or the rule-based detector).
+/// One detected target.
 class Finding {
   final String kind; // soil | void | moisture | organic | rock | metal
-  final String source; // 'AI' or 'Rule'
-  final double confidence; // 0..1
+  final String source; // 'AI' (neural model, experimental) or 'Rule' (smart engine)
+  final double confidence; // 0..1 (an estimate, not a calibrated probability)
   final double r0, c0, r1, c1; // cell bounds in ORIGINAL grid units (r1/c1 exclusive)
   final double peakDelta; // signed extreme deviation from the normal level (counts)
   final double widthCm, lengthCm, depthM;
   final Verdict verdict;
+  final Map<String, double> probs; // class distribution for this target
   const Finding(this.kind, this.source, this.confidence, this.r0, this.c0, this.r1, this.c1,
-      this.peakDelta, this.widthCm, this.lengthCm, this.depthM, this.verdict);
+      this.peakDelta, this.widthCm, this.lengthCm, this.depthM, this.verdict,
+      {this.probs = const {}});
 }
 
 double _median(List<double> v) {
@@ -51,9 +53,38 @@ double _median(List<double> v) {
   return n.isOdd ? s[n ~/ 2] : (s[n ~/ 2 - 1] + s[n ~/ 2]) / 2;
 }
 
-/// Combines the YOLO detections (if the model ran) with a rule-based detector.
-/// The rule-based part always works, so the analysis never returns empty-handed
-/// just because the neural network failed to load.
+/// Knowledge-based classifier. Typical magnetic signatures:
+///  - ferrous metal: strong, compact positive peak, usually with a weak negative side lobe (dipole)
+///  - void / cavity: negative anomaly (less magnetic material than the surroundings)
+///  - rock: broad, moderate positive anomaly
+///  - moisture: broad, weak negative anomaly
+/// The weights are hand-set heuristics (not trained on field data); treat results as guidance.
+Map<String, double> classifyTarget({
+  required double sign,
+  required double ratio, // |peak| / threshold
+  required int area, // cells
+  required double compactness, // area / bounding-box area
+  required double oppRatio, // opposite-polarity lobe / peak
+}) {
+  double sat(double x) => x < 1 ? x : 1;
+  final pos = sign > 0;
+  final s = <String, double>{
+    'metal': pos
+        ? 1.2 * sat(ratio / 4) + 0.8 * (area <= 9 ? 1 : (area <= 16 ? 0.5 : 0)) +
+            0.6 * sat(oppRatio / 0.3) + 0.4 * (compactness > 0.6 ? 1 : 0)
+        : 0.15,
+    'rock': pos ? 0.8 * (area > 9 ? 1 : 0.3) + 0.5 * (ratio < 3 ? 1 : 0.3) + 0.4 * (oppRatio < 0.2 ? 1 : 0) : 0.1,
+    'void': !pos ? 1.4 * sat((ratio - 1) / 2) + 0.6 * (area >= 2 ? 1 : 0.3) + 0.4 * (oppRatio < 0.15 ? 1 : 0) : 0.1,
+    'moisture': !pos ? 0.8 * (area > 6 ? 1 : 0.2) + 0.5 * (ratio < 2.5 ? 1 : 0.2) + 0.4 * (ratio < 2.2 ? 1 : 0) : 0.1,
+    'organic': 0.5 * (ratio < 1.8 ? 1 : 0) + 0.4 * (compactness < 0.5 ? 1 : 0) + 0.1,
+    'soil': 0.3,
+  };
+  final e = s.map((k, v) => MapEntry(k, math.exp(2.0 * v)));
+  final sum = e.values.reduce((a, b) => a + b);
+  return e.map((k, v) => MapEntry(k, v / sum));
+}
+
+/// Smart engine (always works, never crashes) + optional neural-model detections.
 List<Finding> buildFindings({
   required List<List<double>> m, // raw values, no NaN
   required int spacingCm,
@@ -83,7 +114,7 @@ List<Finding> buildFindings({
 
     final w = ((run(0, -1) + run(0, 1) + 1) + (run(-1, 0) + run(1, 0) + 1)) / 2;
     final fwhm = w * spacingCm / 100; // metres
-    return (fwhm / 1.5 * soilFactor).clamp(0.1, 5.0).toDouble(); // rough dipole rule of thumb
+    return (fwhm / 1.5 * soilFactor).clamp(0.1, 5.0).toDouble(); // rough rule of thumb
   }
 
   Verdict verdictFor(String kind, double conf, double peak) {
@@ -101,11 +132,12 @@ List<Finding> buildFindings({
 
   final out = <Finding>[];
 
-  // ---- 1) YOLO detections -> cell coordinates --------------------------
+  // ---- 1) optional neural detections (experimental) -> cell coordinates ----
   if (yolo != null) {
     final scale = math.min(640 / cols, 640 / rows);
     final x0 = (640 - cols * scale) / 2, y0 = (640 - rows * scale) / 2;
     for (final d in yolo.detections.take(12)) {
+      if (d.x2 - d.x1 < 8 || d.y2 - d.y1 < 8) continue; // degenerate boxes
       final c0 = ((d.x1 - x0) / scale).clamp(0.0, cols - 1.0).toDouble();
       final r0 = ((d.y1 - y0) / scale).clamp(0.0, rows - 1.0).toDouble();
       final c1 = ((d.x2 - x0) / scale).clamp(c0 + 1, cols.toDouble()).toDouble();
@@ -123,11 +155,11 @@ List<Finding> buildFindings({
       }
       out.add(Finding(d.label, 'AI', d.confidence, r0, c0, r1, c1, peak,
           (c1 - c0) * spacingCm, (r1 - r0) * spacingCm, depthAt(pr, pc),
-          verdictFor(d.label, d.confidence, peak)));
+          verdictFor(d.label, d.confidence, peak), probs: {d.label: d.confidence}));
     }
   }
 
-  // ---- 2) rule-based detector: connected components over/under normal ----
+  // ---- 2) smart engine: connected components over/under the normal level ----
   final seen = List.generate(rows, (_) => List.filled(cols, false));
   for (var r = 0; r < rows; r++) {
     for (var c = 0; c < cols; c++) {
@@ -154,8 +186,7 @@ List<Finding> buildFindings({
         for (final (dr, dc) in [(1, 0), (-1, 0), (0, 1), (0, -1)]) {
           final nr = cr + dr, nc = cc + dc;
           if (nr < 0 || nr >= rows || nc < 0 || nc >= cols || seen[nr][nc]) continue;
-          final nv = m[nr][nc] - normal;
-          if (nv * sign > thr) {
+          if ((m[nr][nc] - normal) * sign > thr) {
             seen[nr][nc] = true;
             stack.add((nr, nc));
           }
@@ -163,14 +194,28 @@ List<Finding> buildFindings({
       }
       final ratio = peak.abs() / thr;
       if (area == 1 && ratio < 2) continue; // lone weak cell = noise
-      final compact = ratio >= 2 || area <= 4;
-      final kind = sign > 0 ? (compact ? 'metal' : 'rock') : (compact ? 'void' : 'moisture');
-      var conf = math.min(0.9, ratio / (ratio + 1.5));
-      if (!compact) conf *= 0.7;
-      final f = Finding(kind, 'Rule', conf, rMin.toDouble(), cMin.toDouble(), rMax + 1.0, cMax + 1.0,
-          peak, (cMax - cMin + 1) * spacingCm.toDouble(), (rMax - rMin + 1) * spacingCm.toDouble(),
-          depthAt(pr, pc), verdictFor(kind, conf, peak));
-      // skip if an AI box already covers this spot
+
+      // opposite-polarity side lobe near the target (dipole signature)
+      var opp = 0.0;
+      for (var rr = math.max(0, rMin - 2); rr <= math.min(rows - 1, rMax + 2); rr++) {
+        for (var cc = math.max(0, cMin - 2); cc <= math.min(cols - 1, cMax + 2); cc++) {
+          final o = -(m[rr][cc] - normal) * sign;
+          if (o > opp) opp = o;
+        }
+      }
+      final bw = cMax - cMin + 1, bh = rMax - rMin + 1;
+      final probs = classifyTarget(
+        sign: sign,
+        ratio: ratio,
+        area: area,
+        compactness: area / (bw * bh),
+        oppRatio: opp / peak.abs(),
+      );
+      final best = probs.entries.reduce((a, b) => a.value >= b.value ? a : b);
+      if (best.key == 'soil') continue; // ambiguous -> treat as background
+      final f = Finding(best.key, 'Rule', best.value, rMin.toDouble(), cMin.toDouble(), rMax + 1.0,
+          cMax + 1.0, peak, bw * spacingCm.toDouble(), bh * spacingCm.toDouble(), depthAt(pr, pc),
+          verdictFor(best.key, best.value, peak), probs: probs);
       final dup = out.any((o) => o.source == 'AI' && _iou(o, f) > 0.25);
       if (!dup) out.add(f);
     }
@@ -590,12 +635,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
     final raw = s.grid.filled();
     dynamic yolo;
     String? err;
-    if (!s.aiEnabled.value) {
-      err = s.crashStage.value != null
-          ? 'The neural model crashed the app last time (stage: ${s.crashStage.value}). '
-              'It is switched off; rule-based detection is used.'
-          : 'Neural model is switched off in Settings; rule-based detection is used.';
-    } else {
+    if (s.aiEnabled.value) {
       try {
         await s.onnx.init();
         yolo = await s.onnx.analyze(raw,
@@ -826,6 +866,15 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
   }
 
   // ------------------------------------------------------------ AI card
+  /// Top-3 class distribution of the strongest target (like "Metal 85 / Void 10 / Rock 5").
+  List<MapEntry<String, double>> _dist(List<Finding> fl) {
+    if (fl.isEmpty) return const [];
+    final p = fl.first.probs;
+    if (p.length <= 1) return [for (final f in fl.take(3)) MapEntry(f.kind, f.confidence)];
+    final l = p.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+    return l.take(3).toList();
+  }
+
   Widget _aiCard(BuildContext context) {
     final fl = findings;
     return Container(
@@ -839,7 +888,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
         Row(children: [
           const Icon(Icons.psychology, color: TM.cyan),
           const SizedBox(width: 6),
-          Expanded(child: Text(tr(context, 'AI Result', 'نتيجة الذكاء'), style: const TextStyle(fontWeight: FontWeight.bold))),
+          Expanded(child: Text(tr(context, 'Smart Analysis', 'التحليل الذكي'), style: const TextStyle(fontWeight: FontWeight.bold))),
           InkWell(
             onTap: () => setState(() => aiExpanded = !aiExpanded),
             child: Icon(aiExpanded ? Icons.unfold_less : Icons.unfold_more, size: 20, color: TM.grey),
@@ -851,16 +900,19 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
           Text('${fl.length} ${tr(context, 'detections', 'كشوفات')}', style: const TextStyle(color: TM.gold)),
         if (aiExpanded && fl != null && !loading) ...[
           Row(children: [
-            Icon(onnxOk ? Icons.check_circle : Icons.error_outline, size: 14, color: onnxOk ? TM.cyan : TM.gold),
+            Icon(!s.aiEnabled.value || onnxOk ? Icons.check_circle : Icons.error_outline, size: 14,
+                color: !s.aiEnabled.value || onnxOk ? TM.cyan : TM.gold),
             const SizedBox(width: 4),
             Expanded(
               child: GestureDetector(
                 onTap: onnxError == null ? null : () => _showError(context),
                 child: Text(
-                  onnxOk
-                      ? '${tr(context, 'AI model + rules', 'نموذج الذكاء + القواعد')}${onnxInfo == null ? '' : '\n$onnxInfo'}'
-                      : tr(context, 'Rules only (tap: error)', 'القواعد فقط (اضغط للخطأ)'),
-                  style: TextStyle(fontSize: 11, color: onnxOk ? TM.grey : TM.gold),
+                  !s.aiEnabled.value
+                      ? tr(context, 'Smart engine', 'المحرك الذكي')
+                      : (onnxOk
+                          ? '${tr(context, 'Smart engine + neural model', 'المحرك الذكي + النموذج العصبي')}${onnxInfo == null ? '' : '\n$onnxInfo'}'
+                          : tr(context, 'Neural model failed (tap: error)', 'فشل النموذج العصبي (اضغط للخطأ)')),
+                  style: TextStyle(fontSize: 11, color: !s.aiEnabled.value || onnxOk ? TM.grey : TM.gold),
                 ),
               ),
             ),
@@ -868,12 +920,12 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
           const SizedBox(height: 4),
           if (fl.isEmpty)
             Text(tr(context, 'No anomaly detected', 'لا توجد شاذّة'), style: const TextStyle(color: TM.grey)),
-          for (var i = 0; i < fl.length && i < 3; i++) ...[
-            Text('${kindName(context, fl[i].kind)}: ${(fl[i].confidence * 100).round()}%',
-                style: TextStyle(fontWeight: FontWeight.bold, color: i == 0 ? TM.gold : Colors.white)),
+          for (final e in _dist(fl).asMap().entries) ...[
+            Text('${kindName(context, e.value.key)}: ${(e.value.value * 100).round()}%',
+                style: TextStyle(fontWeight: FontWeight.bold, color: e.key == 0 ? TM.gold : Colors.white)),
             Padding(
               padding: const EdgeInsets.only(top: 2, bottom: 6),
-              child: LinearProgressIndicator(value: fl[i].confidence, minHeight: 6, color: kindColor(fl[i].kind), backgroundColor: Colors.white12),
+              child: LinearProgressIndicator(value: e.value.value, minHeight: 6, color: kindColor(e.value.key), backgroundColor: Colors.white12),
             ),
           ],
         ],
@@ -936,7 +988,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
                   '${tr(ctx, 'Size', 'الحجم')}: ${f.widthCm.round()}×${f.lengthCm.round()} cm\n'
                   '${tr(ctx, 'Est. depth', 'العمق التقريبي')}: ${f.depthM.toStringAsFixed(2)} m  '
                   '(${tr(ctx, soilTypes[s.soil.value].en, soilTypes[s.soil.value].ar)})\n'
-                  '${tr(ctx, 'Source', 'المصدر')}: ${f.source == 'AI' ? tr(ctx, 'AI model', 'نموذج الذكاء') : tr(ctx, 'Rule-based', 'قواعد')}',
+                  '${tr(ctx, 'Source', 'المصدر')}: ${f.source == 'AI' ? tr(ctx, 'Neural model', 'النموذج العصبي') : tr(ctx, 'Smart engine', 'المحرك الذكي')}',
                 ),
                 isThreeLine: true,
               ),
@@ -1598,8 +1650,8 @@ void showSettingsSheet(BuildContext context) {
           ValueListenableBuilder<bool>(
             valueListenable: s.aiEnabled,
             builder: (_, v, __) => SwitchListTile(
-              title: Text(tr(ctx, 'Use neural model (ONNX)', 'استخدام نموذج الذكاء (ONNX)')),
-              subtitle: Text(tr(ctx, 'Off = rule-based detection only', 'مطفأ = الكشف بالقواعد فقط')),
+              title: Text(tr(ctx, 'Experimental: neural model (ONNX)', 'تجريبي: النموذج العصبي (ONNX)')),
+              subtitle: Text(tr(ctx, 'May crash on some phones. Off = smart engine only', 'قد ينهار على بعض الهواتف. مطفأ = المحرك الذكي فقط')),
               value: v,
               onChanged: (x) {
                 s.aiEnabled.value = x;
@@ -2395,7 +2447,7 @@ class AppState extends ChangeNotifier {
   final audioOn = ValueNotifier<bool>(true);
   final simulate = ValueNotifier<bool>(false);
   final soil = ValueNotifier<int>(0); // index into soilTypes
-  final aiEnabled = ValueNotifier<bool>(true);
+  final aiEnabled = ValueNotifier<bool>(false); // neural model is experimental: off by default
   final crashStage = ValueNotifier<String?>(null);
   final aiDetrend = ValueNotifier<bool>(true);
   final aiImageNet = ValueNotifier<bool>(false);
