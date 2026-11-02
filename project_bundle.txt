@@ -334,7 +334,7 @@ class OnnxService {
     if (_session != null) return;
     try {
       await CrashGuard.mark('init: createSession');
-      _session = await OnnxRuntime().createSessionFromAsset(modelAsset);
+      _session = await OnnxRuntime().createSessionFromAsset(modelAsset /*ORT_OPTS*/);
       await CrashGuard.mark('done');
     } catch (e) {
       await CrashGuard.mark('done');
@@ -1193,12 +1193,12 @@ class GridProcessor extends ChangeNotifier {
     notifyListeners();
   }
 
-  void loadMatrix(List<List<double>> m, {int? spacing}) {
+  void loadMatrix(List<List<double>> m, {int? spacing, int? cursor}) {
     rows = m.length;
     cols = m.first.length;
     matrix = [for (final r in m) List<double>.from(r)];
     if (spacing != null) spacingCm = spacing;
-    _cursor = rows * cols;
+    _cursor = cursor ?? rows * cols;
     notifyListeners();
   }
 
@@ -1239,6 +1239,7 @@ class GridProcessor extends ChangeNotifier {
         'spacing_cm': spacingCm,
         'snake': snake,
         'start_right': startRight,
+        'cursor': _cursor,
         'matrix': [for (final r in matrix) [for (final v in r) v.isNaN ? null : v]],
       };
 }
@@ -2314,9 +2315,12 @@ class Shell extends StatelessWidget {
 }
 === FILE: lib/services/app_state.dart ===
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 import '../ai/onnx_service.dart';
 import '../features/analysis_3d/grid_processor.dart';
 import 'ble/ble_service.dart';
@@ -2329,6 +2333,37 @@ class AppState extends ChangeNotifier {
   AppState._() {
     ble.samples.listen(_onSample);
     _checkCrash();
+    grid.addListener(_persist);
+    _restore();
+  }
+
+  // ---- the current scan survives app restarts / crashes ----------------
+  Timer? _saveT;
+  Future<File> _curFile() async =>
+      File('${(await getApplicationSupportDirectory()).path}/current_scan.json');
+
+  void _persist() {
+    _saveT?.cancel();
+    _saveT = Timer(const Duration(milliseconds: 500), () async {
+      try {
+        await (await _curFile()).writeAsString(jsonEncode(grid.toJson('current')));
+      } catch (_) {}
+    });
+  }
+
+  Future<void> _restore() async {
+    try {
+      final f = await _curFile();
+      if (!await f.exists()) return;
+      final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+      final m = [
+        for (final r in j['matrix'] as List)
+          [for (final v in r as List) v == null ? double.nan : (v as num).toDouble()]
+      ];
+      grid.snake = j['snake'] as bool? ?? grid.snake;
+      grid.startRight = j['start_right'] as bool? ?? grid.startRight;
+      grid.loadMatrix(m, spacing: j['spacing_cm'] as int?, cursor: j['cursor'] as int?);
+    } catch (_) {}
   }
 
   /// If the last AI run died natively, switch the neural model off and remember where.
@@ -3252,3 +3287,69 @@ class ThermalBar extends StatelessWidget {
     });
   }
 }
+=== FILE: tool/ci_prebuild.sh ===
+#!/usr/bin/env bash
+# Runs in CI after the Android project is generated and before the APK build.
+# Keeps working even if something here fails (the workflow marks it continue-on-error).
+cd "$(dirname "$0")/.." || exit 0
+flutter pub get > /dev/null 2>&1 || flutter pub get
+
+echo "=== flutter_onnxruntime version ==="
+grep -A4 "flutter_onnxruntime:" pubspec.lock | head -8
+P=$(find ~/.pub-cache -type d -name 'flutter_onnxruntime-*' 2>/dev/null | sort | tail -1)
+echo "plugin dir: $P"
+
+python3 - "$P" <<'PY'
+import sys, re, glob, os
+P = sys.argv[1]
+if not P or not os.path.isdir(P):
+    print("plugin dir not found - skipping"); sys.exit(0)
+
+files = glob.glob(P + '/lib/**/*.dart', recursive=True)
+src = {f: open(f, encoding='utf-8', errors='ignore').read() for f in files}
+alltxt = "\n".join(src.values())
+
+def body_of(kind, name):
+    m = re.search(kind + r'\s+' + name + r'\b[^{]*\{(.*?)\n\}', alltxt, re.S)
+    return m.group(1) if m else ''
+
+opts = body_of('class', 'OrtSessionOptions')
+prov = body_of('enum', 'OrtProvider')
+sigs = re.findall(r'createSessionFromAsset\s*\(([^)]*)\)', alltxt, re.S)
+print("OrtSessionOptions fields:", re.findall(r'this\.(\w+)', opts))
+print("OrtProvider values:", re.findall(r'\b([A-Za-z_]+)\s*[,;(]', prov)[:12])
+for s in sigs: print("createSessionFromAsset(", ' '.join(s.split()), ")")
+
+can_options = any(re.search(r'OrtSessionOptions\??\s+options', s) for s in sigs)
+args = []
+if re.search(r'this\.providers', opts) and re.search(r'\bCPU\b', prov):
+    args.append('providers: [OrtProvider.CPU]')
+if re.search(r'this\.intraOpNumThreads', opts):
+    args.append('intraOpNumThreads: 2')
+
+# the class must be exported from the package's main library
+main = os.path.join(P, 'lib', 'flutter_onnxruntime.dart')
+defining = [f for f, t in src.items() if re.search(r'class\s+OrtSessionOptions\b', t)]
+exported = bool(defining) and (defining[0] == main or
+           os.path.basename(defining[0]) in open(main, encoding='utf-8', errors='ignore').read())
+
+target = 'lib/ai/onnx_service.dart'
+t = open(target, encoding='utf-8').read()
+if can_options and args and exported and '/*ORT_OPTS*/' in t:
+    t = t.replace('/*ORT_OPTS*/', ', options: OrtSessionOptions(' + ', '.join(args) + ')')
+    open(target, 'w', encoding='utf-8').write(t)
+    print("PATCHED session options:", args)
+else:
+    print("NOT patched. can_options=%s args=%s exported=%s" % (can_options, args, exported))
+PY
+
+# Give the Java heap more room (harmless safety net)
+python3 - <<'PY'
+p = 'android/app/src/main/AndroidManifest.xml'
+s = open(p, encoding='utf-8').read()
+if 'largeHeap' not in s:
+    s = s.replace('<application', '<application android:largeHeap="true"', 1)
+    open(p, 'w', encoding='utf-8').write(s)
+    print("largeHeap enabled")
+PY
+exit 0
