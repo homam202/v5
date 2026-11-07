@@ -2,7 +2,7 @@
 name: terramag
 description: Fully offline magnetic gradiometer survey app (ESP32 + RM3100).
 publish_to: "none"
-version: 1.1.0+2
+version: 2.0.0+3
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -13,7 +13,6 @@ dependencies:
   flutter_localizations:
     sdk: flutter
   flutter_blue_plus: ^1.32.0
-  flutter_onnxruntime: any
   flutter_compass: ^0.8.0
   audioplayers: ^6.1.0
   file_picker: ^8.1.0
@@ -24,33 +23,40 @@ dependencies:
 
 flutter:
   uses-material-design: true
-  assets:
-    - assets/models/best2.onnx
+=== FILE: tool/ci_prebuild.sh ===
+#!/usr/bin/env bash
+# Runs in CI after the Android project is generated and before the APK build.
+cd "$(dirname "$0")/.." || exit 0
+python3 - <<'PY'
+p = 'android/app/src/main/AndroidManifest.xml'
+s = open(p, encoding='utf-8').read()
+if 'largeHeap' not in s:
+    s = s.replace('<application', '<application android:largeHeap="true"', 1)
+    open(p, 'w', encoding='utf-8').write(s)
+    print("largeHeap enabled")
+PY
+exit 0
 === FILE: lib/ai/findings.dart ===
 import 'dart:math' as math;
-import 'onnx_service.dart';
+import '../core/processing/grid_math.dart';
 
 enum Verdict { realMetal, possibleMetal, realVoid, possibleVoid, looseSoil, reliable, possible, uncertain }
 
 /// One detected target.
 class Finding {
   final String kind; // soil | void | moisture | organic | rock | metal
-  final String source; // 'AI' (neural model, experimental) or 'Rule' (smart engine)
   final double confidence; // 0..1 (an estimate, not a calibrated probability)
   final double r0, c0, r1, c1; // cell bounds in ORIGINAL grid units (r1/c1 exclusive)
   final double peakDelta; // signed extreme deviation from the normal level (counts)
   final double widthCm, lengthCm, depthM;
   final Verdict verdict;
   final Map<String, double> probs; // class distribution for this target
-  const Finding(this.kind, this.source, this.confidence, this.r0, this.c0, this.r1, this.c1,
-      this.peakDelta, this.widthCm, this.lengthCm, this.depthM, this.verdict,
-      {this.probs = const {}});
-}
-
-double _median(List<double> v) {
-  final s = [...v]..sort();
-  final n = s.length;
-  return n.isOdd ? s[n ~/ 2] : (s[n ~/ 2 - 1] + s[n ~/ 2]) / 2;
+  final String shape; // compact | linear | planar
+  final bool edgeCut; // touches the scan border: probably continues outside
+  final bool lowRes; // smaller than the scan resolution can describe
+  const Finding(this.kind, this.confidence, this.r0, this.c0, this.r1, this.c1, this.peakDelta,
+      this.widthCm, this.lengthCm, this.depthM, this.verdict,
+      {this.probs = const {}, this.shape = 'compact', this.edgeCut = false, this.lowRes = false});
 }
 
 /// Knowledge-based classifier. Typical magnetic signatures:
@@ -74,8 +80,8 @@ Map<String, double> classifyTarget({
             0.6 * sat(oppRatio / 0.3) + 0.4 * (compactness > 0.6 ? 1 : 0)
         : 0.15,
     'rock': pos ? 0.8 * (area > 9 ? 1 : 0.3) + 0.5 * (ratio < 3 ? 1 : 0.3) + 0.4 * (oppRatio < 0.2 ? 1 : 0) : 0.1,
-    'void': !pos ? 1.4 * sat((ratio - 1) / 2) + 0.6 * (area >= 2 ? 1 : 0.3) + 0.4 * (oppRatio < 0.15 ? 1 : 0) : 0.1,
-    'moisture': !pos ? 0.8 * (area > 6 ? 1 : 0.2) + 0.5 * (ratio < 2.5 ? 1 : 0.2) + 0.4 * (ratio < 2.2 ? 1 : 0) : 0.1,
+    'void': !pos ? 1.2 * sat(ratio / 3) + 0.6 * (area >= 2 ? 1 : 0.3) + 0.4 * (oppRatio < 0.15 ? 1 : 0) : 0.1,
+    'moisture': !pos ? 0.8 * (area > 9 ? 1 : 0.2) + 0.5 * (ratio < 2.5 ? 1 : 0.2) : 0.1,
     'organic': 0.5 * (ratio < 1.8 ? 1 : 0) + 0.4 * (compactness < 0.5 ? 1 : 0) + 0.1,
     'soil': 0.3,
   };
@@ -84,19 +90,22 @@ Map<String, double> classifyTarget({
   return e.map((k, v) => MapEntry(k, v / sum));
 }
 
-/// Smart engine (always works, never crashes) + optional neural-model detections.
+/// Smart engine: always works, never needs a model.
 List<Finding> buildFindings({
-  required List<List<double>> m, // raw values, no NaN
+  required List<List<double>> m, // values to analyse, no NaN
   required int spacingCm,
   required double thrCounts, // user threshold converted to sensor counts
   required double soilFactor,
-  AiResult? yolo,
+  double ntPerCount = 1.0,
+  double refDepthCm = 0, // optional depth calibration: known depth ...
+  double refAmpNt = 0, // ... at a known amplitude
 }) {
   final rows = m.length, cols = m.first.length;
-  final flat = m.expand((r) => r).toList();
-  final normal = _median(flat); // "normal soil value"
-  final sigma = 1.4826 * _median(flat.map((v) => (v - normal).abs()).toList());
+  final flat = [for (final r in m) ...r];
+  final normal = median(flat); // "normal soil value"
+  final sigma = robustSigma(flat);
   final thr = math.max(thrCounts, 3 * sigma).clamp(1.0, 1e9).toDouble();
+  final calibrated = refDepthCm > 0 && refAmpNt > 0;
 
   double depthAt(int pr, int pc) {
     final peak = m[pr][pc] - normal;
@@ -114,7 +123,12 @@ List<Finding> buildFindings({
 
     final w = ((run(0, -1) + run(0, 1) + 1) + (run(-1, 0) + run(1, 0) + 1)) / 2;
     final fwhm = w * spacingCm / 100; // metres
-    return (fwhm / 1.5 * soilFactor).clamp(0.1, 5.0).toDouble(); // rough rule of thumb
+    final byWidth = fwhm / 1.5 * soilFactor; // rough rule of thumb
+    if (!calibrated) return byWidth.clamp(0.1, 5.0).toDouble();
+    // point-source amplitude falls roughly with 1/z^3
+    final ampNt = math.max(peak.abs() * ntPerCount, 1e-6);
+    final byAmp = refDepthCm / 100 * math.pow(refAmpNt / ampNt, 1 / 3);
+    return (0.5 * byWidth + 0.5 * byAmp).clamp(0.1, 5.0).toDouble();
   }
 
   Verdict verdictFor(String kind, double conf, double peak) {
@@ -131,35 +145,6 @@ List<Finding> buildFindings({
   }
 
   final out = <Finding>[];
-
-  // ---- 1) optional neural detections (experimental) -> cell coordinates ----
-  if (yolo != null) {
-    final scale = math.min(640 / cols, 640 / rows);
-    final x0 = (640 - cols * scale) / 2, y0 = (640 - rows * scale) / 2;
-    for (final d in yolo.detections.take(12)) {
-      if (d.x2 - d.x1 < 8 || d.y2 - d.y1 < 8) continue; // degenerate boxes
-      final c0 = ((d.x1 - x0) / scale).clamp(0.0, cols - 1.0).toDouble();
-      final r0 = ((d.y1 - y0) / scale).clamp(0.0, rows - 1.0).toDouble();
-      final c1 = ((d.x2 - x0) / scale).clamp(c0 + 1, cols.toDouble()).toDouble();
-      final r1 = ((d.y2 - y0) / scale).clamp(r0 + 1, rows.toDouble()).toDouble();
-      var peak = 0.0, pr = r0.floor(), pc = c0.floor();
-      for (var r = r0.floor(); r < r1.ceil() && r < rows; r++) {
-        for (var c = c0.floor(); c < c1.ceil() && c < cols; c++) {
-          final dv = m[r][c] - normal;
-          if (dv.abs() > peak.abs()) {
-            peak = dv;
-            pr = r;
-            pc = c;
-          }
-        }
-      }
-      out.add(Finding(d.label, 'AI', d.confidence, r0, c0, r1, c1, peak,
-          (c1 - c0) * spacingCm, (r1 - r0) * spacingCm, depthAt(pr, pc),
-          verdictFor(d.label, d.confidence, peak), probs: {d.label: d.confidence}));
-    }
-  }
-
-  // ---- 2) smart engine: connected components over/under the normal level ----
   final seen = List.generate(rows, (_) => List.filled(cols, false));
   for (var r = 0; r < rows; r++) {
     for (var c = 0; c < cols; c++) {
@@ -204,318 +189,522 @@ List<Finding> buildFindings({
         }
       }
       final bw = cMax - cMin + 1, bh = rMax - rMin + 1;
+      final compactness = area / (bw * bh);
       final probs = classifyTarget(
         sign: sign,
         ratio: ratio,
         area: area,
-        compactness: area / (bw * bh),
+        compactness: compactness,
         oppRatio: opp / peak.abs(),
       );
       final best = probs.entries.reduce((a, b) => a.value >= b.value ? a : b);
       if (best.key == 'soil') continue; // ambiguous -> treat as background
-      final f = Finding(best.key, 'Rule', best.value, rMin.toDouble(), cMin.toDouble(), rMax + 1.0,
-          cMax + 1.0, peak, bw * spacingCm.toDouble(), bh * spacingCm.toDouble(), depthAt(pr, pc),
-          verdictFor(best.key, best.value, peak), probs: probs);
-      final dup = out.any((o) => o.source == 'AI' && _iou(o, f) > 0.25);
-      if (!dup) out.add(f);
+
+      final aspect = math.max(bw, bh) / math.min(bw, bh);
+      final shape = (aspect >= 3 && math.min(bw, bh) <= 2)
+          ? 'linear'
+          : ((area >= 16 && compactness > 0.5 && math.min(bw, bh) >= 4) ? 'planar' : 'compact');
+      out.add(Finding(best.key, best.value, rMin.toDouble(), cMin.toDouble(), rMax + 1.0, cMax + 1.0, peak,
+          bw * spacingCm.toDouble(), bh * spacingCm.toDouble(), depthAt(pr, pc),
+          verdictFor(best.key, best.value, peak),
+          probs: probs,
+          shape: shape,
+          edgeCut: rMin == 0 || cMin == 0 || rMax == rows - 1 || cMax == cols - 1,
+          lowRes: area <= 1));
     }
   }
 
   out.sort((a, b) => b.confidence.compareTo(a.confidence));
   return out;
 }
-
-double _iou(Finding a, Finding b) {
-  final ix = math.max(0.0, math.min(a.c1, b.c1) - math.max(a.c0, b.c0));
-  final iy = math.max(0.0, math.min(a.r1, b.r1) - math.max(a.r0, b.r0));
-  final inter = ix * iy;
-  final u = (a.c1 - a.c0) * (a.r1 - a.r0) + (b.c1 - b.c0) * (b.r1 - b.r0) - inter;
-  return u <= 0 ? 0 : inter / u;
-}
-=== FILE: lib/ai/heatmap_renderer.dart ===
-import 'dart:typed_data';
-import '../features/analysis_3d/grid_processor.dart' show ScanStats, jetRelative;
-
-/// Matrix (RAW sensor values, no NaN) -> YOLO tensor float32 NCHW [1,3,640,640], RGB 0..1.
-/// Pipeline: optional plane detrend -> bicubic upsampling -> data-relative Jet colours
-/// -> letterbox (grey 114/255), matching Ultralytics preprocessing.
-class HeatmapRenderer {
-  static const int size = 640;
-
-  static Float32List toTensor(List<List<double>> raw, {bool detrend = true, bool imagenet = false}) {
-    var m = detrend ? removePlane(raw) : raw;
-    final rows = m.length, cols = m.first.length;
-
-    // Statistics AFTER detrending, because colours are relative to them.
-    final flat = m.expand((r) => r).toList();
-    final lo = flat.reduce((a, b) => a < b ? a : b);
-    final hi = flat.reduce((a, b) => a > b ? a : b);
-    final avg = flat.reduce((a, b) => a + b) / flat.length;
-    final stats = ScanStats(lo, avg, hi);
-
-    final scale = (size / cols) < (size / rows) ? size / cols : size / rows;
-    final w = (cols * scale).round(), h = (rows * scale).round();
-    final x0 = (size - w) ~/ 2, y0 = (size - h) ~/ 2;
-
-    const pad = 114 / 255.0;
-    const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
-    double nrm(double v, int ch) => imagenet ? (v - mean[ch]) / std[ch] : v;
-    final plane = size * size;
-    final out = Float32List(3 * plane);
-    for (var ch = 0; ch < 3; ch++) {
-      out.fillRange(ch * plane, (ch + 1) * plane, nrm(pad, ch));
-    }
-
-    for (var y = 0; y < h; y++) {
-      final fy = ((y + 0.5) / scale - 0.5).clamp(0.0, rows - 1.0);
-      for (var x = 0; x < w; x++) {
-        final fx = ((x + 0.5) / scale - 0.5).clamp(0.0, cols - 1.0);
-        final v = bicubic(m, fy, fx).clamp(lo, hi); // clamp kills overshoot
-        final (r, g, b) = jetRelative(v, stats);
-        final p = (y0 + y) * size + (x0 + x);
-        out[p] = nrm(r, 0);
-        out[plane + p] = nrm(g, 1);
-        out[2 * plane + p] = nrm(b, 2);
-      }
-    }
-    return out;
-  }
-
-  /// Least-squares plane z = a*x + b*y + c is subtracted (the mean is kept),
-  /// removing a uniform tilt/gradient so local anomalies stand out.
-  static List<List<double>> removePlane(List<List<double>> m) {
-    final rows = m.length, cols = m.first.length;
-    final xm = (cols - 1) / 2, ym = (rows - 1) / 2;
-    double mean = 0, sxz = 0, syz = 0, sxx = 0, syy = 0;
-    for (var r = 0; r < rows; r++) {
-      for (var c = 0; c < cols; c++) {
-        mean += m[r][c];
-      }
-    }
-    mean /= rows * cols;
-    for (var r = 0; r < rows; r++) {
-      for (var c = 0; c < cols; c++) {
-        final dx = c - xm, dy = r - ym, dz = m[r][c] - mean;
-        sxz += dx * dz; syz += dy * dz; sxx += dx * dx; syy += dy * dy;
-      }
-    }
-    final a = sxx == 0 ? 0.0 : sxz / sxx, b = syy == 0 ? 0.0 : syz / syy;
-    return [
-      for (var r = 0; r < rows; r++)
-        [for (var c = 0; c < cols; c++) m[r][c] - a * (c - xm) - b * (r - ym)]
-    ];
-  }
-
-  // Catmull-Rom cubic interpolation on a 4x4 neighbourhood.
-  static double _cr(double t, double p0, double p1, double p2, double p3) =>
-      0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t +
-          (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
-
-  static double bicubic(List<List<double>> m, double fy, double fx) {
-    final rows = m.length, cols = m.first.length;
-    final iy = fy.floor(), ix = fx.floor();
-    final ty = fy - iy, tx = fx - ix;
-    final col = List<double>.filled(4, 0);
-    for (var j = -1; j <= 2; j++) {
-      final r = (iy + j).clamp(0, rows - 1);
-      double g(int dx) => m[r][(ix + dx).clamp(0, cols - 1)];
-      col[j + 1] = _cr(tx, g(-1), g(0), g(1), g(2));
-    }
-    return _cr(ty, col[0], col[1], col[2], col[3]);
-  }
-}
-=== FILE: lib/ai/onnx_service.dart ===
+=== FILE: lib/core/processing/fft.dart ===
 import 'dart:math' as math;
-import 'dart:typed_data';
-import 'package:flutter/foundation.dart';
-import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
-import '../services/crash_guard.dart';
-import 'heatmap_renderer.dart';
 
-/// One detected anomaly (box in 640x640 letterboxed pixel space).
-class Detection {
-  final int classId;
-  final String label;
-  final double confidence; // 0..1
-  final double x1, y1, x2, y2;
-  const Detection(this.classId, this.label, this.confidence, this.x1, this.y1, this.x2, this.y2);
+int nextPow2(int n) {
+  var p = 1;
+  while (p < n) {
+    p <<= 1;
+  }
+  return p;
 }
 
-class AiResult {
-  final List<Detection> detections; // after NMS, sorted by confidence
-  final Map<String, double> bestPerClass; // best score per class, over ALL anchors (before threshold)
-  final double maxScore; // highest class score anywhere: tells "ran, nothing found" from "broken"
-  final int millis; // inference time
-  const AiResult(this.detections, this.bestPerClass, {this.maxScore = 0, this.millis = 0});
-  Detection? get top => detections.isEmpty ? null : detections.first;
-}
-
-class OnnxServiceException implements Exception {
-  final String message;
-  OnnxServiceException(this.message);
-  @override
-  String toString() => 'OnnxServiceException: $message';
-}
-
-/// Local inference for best2.onnx (Ultralytics YOLOv8 detect, 6 classes).
-///   input  'images'  float32 [1,3,640,640]  RGB 0..1, NCHW
-///   output 'output0' float32 [1,10,8400]    channel-major: value(c, i) = flat[c * 8400 + i]
-///                    c 0-3 = cx,cy,w,h (640-px letterbox space), c 4-9 = class scores (already sigmoid)
-///   NMS is NOT inside the graph, so it is done here.
-class OnnxService {
-  static const modelAsset = 'assets/models/best2.onnx';
-  static const inputName = 'images';
-  static const outputName = 'output0';
-  static const labels = ['soil', 'void', 'moisture', 'organic', 'rock', 'metal'];
-  static const numAnchors = 8400;
-  static const size = HeatmapRenderer.size; // 640
-  static const _maxCandidates = 300; // cap before NMS (keeps NMS fast)
-
-  OrtSession? _session;
-  bool _busy = false;
-  bool get isReady => _session != null;
-
-  Future<void> init() async {
-    if (_session != null) return;
-    try {
-      await CrashGuard.mark('init: createSession');
-      _session = await OnnxRuntime().createSessionFromAsset(modelAsset /*ORT_OPTS*/);
-      await CrashGuard.mark('done');
-    } catch (e) {
-      await CrashGuard.mark('done');
-      throw OnnxServiceException('Failed to load model: $e');
+/// In-place iterative radix-2 FFT. Length must be a power of two.
+void fft1d(List<double> re, List<double> im, {bool inverse = false}) {
+  final n = re.length;
+  // bit reversal
+  var j = 0;
+  for (var i = 1; i < n; i++) {
+    var bit = n >> 1;
+    for (; (j & bit) != 0; bit >>= 1) {
+      j ^= bit;
+    }
+    j ^= bit;
+    if (i < j) {
+      final tr = re[i];
+      re[i] = re[j];
+      re[j] = tr;
+      final ti = im[i];
+      im[i] = im[j];
+      im[j] = ti;
     }
   }
-
-  /// [raw] = 2-D matrix of RAW sensor values without NaN (GridProcessor.filled()).
-  Future<AiResult> analyze(
-    List<List<double>> raw, {
-    double confThreshold = 0.25,
-    double iouThreshold = 0.45,
-    bool detrend = true,
-    bool imagenet = false,
-  }) async {
-    if (_session == null) throw OnnxServiceException('Call init() first.');
-    if (_busy) throw OnnxServiceException('Inference already running.');
-    if (raw.isEmpty || raw.first.isEmpty) throw OnnxServiceException('Empty matrix.');
-    _busy = true;
-
-    final sw = Stopwatch()..start();
-    OrtValue? input;
-    Map<String, OrtValue>? outputs;
-    try {
-      // 1) matrix -> heat-map -> flat Float32List, NCHW (heavy loop: off the UI isolate)
-      await CrashGuard.mark('infer: buildTensor');
-      final Float32List tensor = await compute(_buildTensor, (raw, detrend, imagenet));
-      const expected = 1 * 3 * size * size;
-      if (tensor.length != expected) {
-        throw OnnxServiceException('Tensor length ${tensor.length}, expected $expected.');
+  for (var len = 2; len <= n; len <<= 1) {
+    final ang = 2 * math.pi / len * (inverse ? 1 : -1);
+    final wr = math.cos(ang), wi = math.sin(ang);
+    for (var i = 0; i < n; i += len) {
+      var cr = 1.0, ci = 0.0;
+      for (var k = 0; k < len ~/ 2; k++) {
+        final a = i + k, b = i + k + len ~/ 2;
+        final xr = re[b] * cr - im[b] * ci;
+        final xi = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - xr;
+        im[b] = im[a] - xi;
+        re[a] += xr;
+        im[a] += xi;
+        final ncr = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr;
+        cr = ncr;
       }
-      for (var i = 0; i < tensor.length; i += 997) {
-        if (!tensor[i].isFinite) throw OnnxServiceException('Tensor contains NaN/Inf.');
+    }
+  }
+  if (inverse) {
+    for (var i = 0; i < n; i++) {
+      re[i] /= n;
+      im[i] /= n;
+    }
+  }
+}
+
+int _reflect(int i, int n) {
+  final p = 2 * n;
+  var k = i % p;
+  if (k < 0) k += p;
+  return k < n ? k : p - 1 - k;
+}
+
+/// Applies a radially symmetric gain g(k) (k in rad/cell) in the frequency domain.
+/// The grid is mirror-padded to a power of two to limit edge artefacts.
+List<List<double>> spectralGain(List<List<double>> m, double Function(double k) gain) {
+  final rows = m.length, cols = m.first.length;
+  final pr = nextPow2(rows * 2), pc = nextPow2(cols * 2);
+  final or = (pr - rows) ~/ 2, oc = (pc - cols) ~/ 2;
+  final re = List.generate(pr, (i) => List.generate(pc, (j) => m[_reflect(i - or, rows)][_reflect(j - oc, cols)]));
+  final im = List.generate(pr, (_) => List.filled(pc, 0.0));
+
+  for (var i = 0; i < pr; i++) {
+    fft1d(re[i], im[i]);
+  }
+  for (var j = 0; j < pc; j++) {
+    final cr = [for (var i = 0; i < pr; i++) re[i][j]];
+    final ci = [for (var i = 0; i < pr; i++) im[i][j]];
+    fft1d(cr, ci);
+    for (var i = 0; i < pr; i++) {
+      re[i][j] = cr[i];
+      im[i][j] = ci[i];
+    }
+  }
+  for (var i = 0; i < pr; i++) {
+    final ky = 2 * math.pi * (i <= pr ~/ 2 ? i : i - pr) / pr;
+    for (var j = 0; j < pc; j++) {
+      final kx = 2 * math.pi * (j <= pc ~/ 2 ? j : j - pc) / pc;
+      final g = gain(math.sqrt(kx * kx + ky * ky));
+      re[i][j] *= g;
+      im[i][j] *= g;
+    }
+  }
+  for (var j = 0; j < pc; j++) {
+    final cr = [for (var i = 0; i < pr; i++) re[i][j]];
+    final ci = [for (var i = 0; i < pr; i++) im[i][j]];
+    fft1d(cr, ci, inverse: true);
+    for (var i = 0; i < pr; i++) {
+      re[i][j] = cr[i];
+      im[i][j] = ci[i];
+    }
+  }
+  for (var i = 0; i < pr; i++) {
+    fft1d(re[i], im[i], inverse: true);
+  }
+  return List.generate(rows, (r) => List.generate(cols, (c) => re[r + or][c + oc]));
+}
+=== FILE: lib/core/processing/grid_math.dart ===
+import 'dart:math' as math;
+
+/// Small numeric helpers shared by the filters, the health report and the engine.
+double median(List<double> v) {
+  if (v.isEmpty) return 0;
+  final s = [...v]..sort();
+  final n = s.length;
+  return n.isOdd ? s[n ~/ 2] : (s[n ~/ 2 - 1] + s[n ~/ 2]) / 2;
+}
+
+/// Robust sigma (1.4826 * MAD) of a sample.
+double robustSigma(List<double> v) {
+  if (v.isEmpty) return 0;
+  final m = median(v);
+  return 1.4826 * median([for (final x in v) (x - m).abs()]);
+}
+
+List<List<double>> copyMatrix(List<List<double>> m) => [for (final r in m) List<double>.from(r)];
+
+/// Median of the 3x3 neighbourhood (edges use the available cells).
+List<List<double>> median3x3(List<List<double>> m) {
+  final rows = m.length, cols = m.first.length;
+  return List.generate(rows, (r) {
+    return List.generate(cols, (c) {
+      final w = <double>[];
+      for (var dr = -1; dr <= 1; dr++) {
+        for (var dc = -1; dc <= 1; dc++) {
+          final rr = r + dr, cc = c + dc;
+          if (rr >= 0 && rr < rows && cc >= 0 && cc < cols) w.add(m[rr][cc]);
+        }
       }
+      return median(w);
+    });
+  });
+}
 
-      // 2) shape [1,3,640,640]
-      await CrashGuard.mark('infer: createInputValue');
-      input = await OrtValue.fromList(tensor, [1, 3, size, size]);
+/// Robust tilt removal (iterative plane fit that ignores outliers). Keeps the mean level.
+/// Returns the corrected matrix; [tilt] (if given) receives a, b in counts per cell.
+List<List<double>> removePlane(List<List<double>> m, {List<double>? tilt}) {
+  final rows = m.length, cols = m.first.length;
+  final xm = (cols - 1) / 2, ym = (rows - 1) / 2;
+  var mask = List.generate(rows, (_) => List.filled(cols, true));
+  double a = 0, b = 0;
 
-      // 3) run
-      await CrashGuard.mark('infer: session.run');
-      outputs = await _session!.run({inputName: input});
-      final out = outputs[outputName] ?? (outputs.isEmpty ? null : outputs.values.first);
-      if (out == null) throw OnnxServiceException('Model returned no outputs.');
-
-      // 4) read: flatten whatever nesting the plugin returns, convert safely to double
-      await CrashGuard.mark('infer: readOutput');
-      final rawOut = await out.asFlattenedList();
-      const want = (4 + 6) * numAnchors;
-      if (rawOut.length != want) {
-        throw OnnxServiceException('Unexpected output size ${rawOut.length} (expected $want).');
+  for (var iter = 0; iter < 4; iter++) {
+    double sx = 0, sy = 0, sz = 0, sxx = 0, syy = 0, sxy = 0, sxz = 0, syz = 0, n = 0;
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        if (!mask[r][c]) continue;
+        final x = c - xm, y = r - ym, z = m[r][c];
+        n++;
+        sx += x;
+        sy += y;
+        sz += z;
+        sxx += x * x;
+        syy += y * y;
+        sxy += x * y;
+        sxz += x * z;
+        syz += y * z;
       }
-      final flat = Float32List(want);
-      for (var i = 0; i < want; i++) {
-        final e = rawOut[i];
-        flat[i] = e is num ? e.toDouble() : double.tryParse('$e') ?? double.nan;
-      }
+    }
+    if (n < 6) break;
+    final det = sxx * (syy * n - sy * sy) - sxy * (sxy * n - sy * sx) + sx * (sxy * sy - syy * sx);
+    if (det.abs() < 1e-9) break;
+    a = (sxz * (syy * n - sy * sy) - sxy * (syz * n - sy * sz) + sx * (syz * sy - syy * sz)) / det;
+    b = (sxx * (syz * n - sz * sy) - sxz * (sxy * n - sy * sx) + sx * (sxy * sz - syz * sx)) / det;
+    final c0 = (sxx * (syy * sz - sy * syz) - sxy * (sxy * sz - syz * sx) + sxz * (sxy * sy - syy * sx)) / det;
 
-      // 5) decode + NMS
-      await CrashGuard.mark('infer: decode');
-      final res = _decode(flat, confThreshold, iouThreshold, sw.elapsedMilliseconds);
-      await CrashGuard.mark('done');
-      return res;
-    } on OnnxServiceException {
-      rethrow;
-    } catch (e) {
-      throw OnnxServiceException('Inference failed: $e');
-    } finally {
-      // Always free native memory, even on error.
-      await CrashGuard.mark('infer: dispose');
-      try {
-        await input?.dispose();
-        if (outputs != null) {
-          for (final v in outputs.values) {
-            await v.dispose();
+    final res = [
+      for (var r = 0; r < rows; r++)
+        for (var c = 0; c < cols; c++) m[r][c] - (a * (c - xm) + b * (r - ym) + c0)
+    ];
+    final med = median(res);
+    final sigma = math.max(1.4826 * median([for (final v in res) (v - med).abs()]), 1.0);
+    final next = [
+      for (var r = 0; r < rows; r++)
+        [for (var c = 0; c < cols; c++) (res[r * cols + c] - med).abs() < 2.5 * sigma]
+    ];
+    if (next.expand((r) => r).where((v) => v).length < 6) break;
+    mask = next;
+  }
+  if (tilt != null) {
+    tilt
+      ..clear()
+      ..addAll([a, b]);
+  }
+  return [
+    for (var r = 0; r < rows; r++) [for (var c = 0; c < cols; c++) m[r][c] - a * (c - xm) - b * (r - ym)]
+  ];
+}
+
+// Catmull-Rom cubic interpolation on a 4x4 neighbourhood.
+double _cr(double t, double p0, double p1, double p2, double p3) =>
+    0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t +
+        (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
+
+double bicubic(List<List<double>> m, double fy, double fx) {
+  final rows = m.length, cols = m.first.length;
+  final iy = fy.floor(), ix = fx.floor();
+  final ty = fy - iy, tx = fx - ix;
+  final col = List<double>.filled(4, 0);
+  for (var j = -1; j <= 2; j++) {
+    final r = (iy + j).clamp(0, rows - 1);
+    double g(int dx) => m[r][(ix + dx).clamp(0, cols - 1)];
+    col[j + 1] = _cr(tx, g(-1), g(0), g(1), g(2));
+  }
+  return _cr(ty, col[0], col[1], col[2], col[3]);
+}
+
+/// Bilinear resampling to [rows] x [cols] (used to align a reference scan with the current grid).
+List<List<double>> resample(List<List<double>> m, int rows, int cols) {
+  final r0 = m.length, c0 = m.first.length;
+  if (r0 == rows && c0 == cols) return copyMatrix(m);
+  return List.generate(rows, (r) {
+    final fy = rows == 1 ? 0.0 : r * (r0 - 1) / (rows - 1);
+    return List.generate(cols, (c) {
+      final fx = cols == 1 ? 0.0 : c * (c0 - 1) / (cols - 1);
+      final iy = fy.floor(), ix = fx.floor();
+      final iy1 = math.min(iy + 1, r0 - 1), ix1 = math.min(ix + 1, c0 - 1);
+      final ty = fy - iy, tx = fx - ix;
+      return (m[iy][ix] * (1 - tx) + m[iy][ix1] * tx) * (1 - ty) + (m[iy1][ix] * (1 - tx) + m[iy1][ix1] * tx) * ty;
+    });
+  });
+}
+
+/// Pearson correlation of two equally sized matrices.
+double correlation(List<List<double>> a, List<List<double>> b) {
+  final x = [for (final r in a) ...r], y = [for (final r in b) ...r];
+  final n = x.length;
+  final mx = x.reduce((p, q) => p + q) / n, my = y.reduce((p, q) => p + q) / n;
+  var sxy = 0.0, sxx = 0.0, syy = 0.0;
+  for (var i = 0; i < n; i++) {
+    sxy += (x[i] - mx) * (y[i] - my);
+    sxx += (x[i] - mx) * (x[i] - mx);
+    syy += (y[i] - my) * (y[i] - my);
+  }
+  final d = math.sqrt(sxx * syy);
+  return d < 1e-9 ? 0 : sxy / d;
+}
+=== FILE: lib/core/processing/health.dart ===
+import 'dart:math' as math;
+import 'grid_math.dart';
+
+/// Scan quality report (6 metrics, 0..1 each) with a grade and plain-language diagnostics.
+class HealthReport {
+  final Map<String, double> metrics; // coverage, saturation, purity, coherence, background, support
+  final double score; // 0..1
+  final String grade; // E | G | F | P
+  final List<String> issues; // dg0..dg6
+  final int unscanned, saturated;
+  const HealthReport(this.metrics, this.score, this.grade, this.issues, this.unscanned, this.saturated);
+}
+
+HealthReport computeHealth({
+  required List<List<double>> raw, // NaN = not measured
+  required int spacingCm,
+  required double thrCounts,
+  double satMax = 1023,
+}) {
+  final rows = raw.length, cols = raw.first.length;
+  final total = rows * cols;
+  final measured = [for (final r in raw) ...r.where((v) => !v.isNaN)];
+  final unscanned = total - measured.length;
+  final coverage = total == 0 ? 0.0 : measured.length / total;
+  if (measured.length < 6) {
+    return HealthReport(
+        {'coverage': coverage, 'saturation': 1, 'purity': 1, 'coherence': 1, 'background': 1, 'support': 1},
+        coverage * 0.5, 'P', ['dg1'], unscanned, 0);
+  }
+  final med0 = median(measured);
+  final m = [for (final r in raw) [for (final v in r) v.isNaN ? med0 : v]];
+
+  final saturated = measured.where((v) => v <= 0 || v >= satMax).length;
+  final satFree = 1 - saturated / measured.length;
+
+  final med3 = median3x3(m);
+  final res = [for (var r = 0; r < rows; r++) [for (var c = 0; c < cols; c++) m[r][c] - med3[r][c]]];
+  final sg = math.max(robustSigma([for (final r in res) ...r]), 1.0);
+  final spikes = [for (final r in res) ...r].where((v) => v.abs() > 3.5 * sg).length;
+  final spikeFrac = spikes / total;
+  final purity = 1 - math.min(1.0, spikeFrac * 5);
+
+  final tilt = <double>[];
+  final flat = removePlane(m, tilt: tilt);
+  // Striping = row-to-row jumps. The 2nd difference of the row medians ignores smooth real anomalies.
+  final diffs = <double>[];
+  for (var r = 0; r < rows; r++) {
+    for (var c = 0; c + 1 < cols; c++) {
+      diffs.add(m[r][c + 1] - m[r][c]);
+    }
+  }
+  final noise = math.max(robustSigma(diffs) / math.sqrt(2), 1.0); // within-row noise
+  final offs = [for (final r in flat) median(r)];
+  var coherence = 1.0;
+  if (rows >= 5) {
+    final d2 = [for (var i = 1; i + 1 < rows; i++) (offs[i + 1] - 2 * offs[i] + offs[i - 1]).abs()];
+    final stripeSd = median(d2) * 1.4826 / math.sqrt(6);
+    final expected = noise / math.sqrt(cols) * 1.25;
+    final ratio = stripeSd / math.max(expected, 0.5);
+    coherence = 1 - ((ratio - 1.5) / 4).clamp(0.0, 1.0).toDouble();
+  }
+
+  final drift = math.sqrt(math.pow(tilt[0] * cols, 2) + math.pow(tilt[1] * rows, 2));
+  final background = 1 - (drift / math.max(3 * thrCounts, 1)).clamp(0.0, 1.0).toDouble();
+
+  final normal = median([for (final r in m) ...r]);
+  var anomalous = 0, supported = 0;
+  for (var r = 0; r < rows; r++) {
+    for (var c = 0; c < cols; c++) {
+      final dv = m[r][c] - normal;
+      if (dv.abs() <= thrCounts) continue;
+      anomalous++;
+      var ok = false;
+      for (final d in const [(1, 0), (-1, 0), (0, 1), (0, -1)]) {
+        final rr = r + d.$1, cc = c + d.$2;
+        if (rr < 0 || rr >= rows || cc < 0 || cc >= cols) continue;
+        if ((m[rr][cc] - normal) * dv > 0 && (m[rr][cc] - normal).abs() > thrCounts) ok = true;
+      }
+      if (ok) supported++;
+    }
+  }
+  final support = anomalous == 0 ? 1.0 : supported / anomalous;
+
+  final score = (1.5 * coverage + satFree + purity + coherence + background + support) / 6.5;
+  final grade = score >= 0.85 ? 'E' : (score >= 0.7 ? 'G' : (score >= 0.5 ? 'F' : 'P'));
+
+  final issues = <String>[];
+  if (unscanned > 0) issues.add('dg1');
+  if (saturated > 0) issues.add('dg2');
+  if (spikeFrac > 0.03) issues.add('dg3');
+  if (coherence < 0.7) issues.add('dg4');
+  if (background < 0.7) issues.add('dg5');
+  if (spacingCm > 40) issues.add('dg6');
+  if (issues.isEmpty) issues.add('dg0');
+
+  return HealthReport({
+    'coverage': coverage,
+    'saturation': satFree,
+    'purity': purity,
+    'coherence': coherence,
+    'background': background,
+    'support': support,
+  }, score, grade, issues, unscanned, saturated);
+}
+=== FILE: lib/core/processing/pipeline.dart ===
+import 'dart:math' as math;
+import 'fft.dart';
+import 'grid_math.dart';
+
+/// Processing steps (non-destructive stack, like a filter history).
+enum ProcStep { despike, destripe, background, smooth, edgePreserve, analytic, secondDeriv, upward }
+
+List<List<double>> applySteps(List<List<double>> m, List<ProcStep> steps) {
+  var cur = m;
+  for (final s in steps) {
+    cur = applyStep(cur, s);
+  }
+  return cur;
+}
+
+List<List<double>> applyStep(List<List<double>> m, ProcStep s) {
+  switch (s) {
+    case ProcStep.despike:
+      return _despike(m);
+    case ProcStep.destripe:
+      return _destripe(m);
+    case ProcStep.background:
+      return _background(m);
+    case ProcStep.smooth:
+      return gaussianBlur(m, 1.0);
+    case ProcStep.edgePreserve:
+      return _bilateral(m);
+    case ProcStep.analytic:
+      return _analytic(m);
+    case ProcStep.secondDeriv:
+      return spectralGain(m, (k) => k * k);
+    case ProcStep.upward:
+      return upwardContinue(m, 2.0);
+  }
+}
+
+/// Upward continuation by [h] cells (smooths and emphasises deeper sources).
+List<List<double>> upwardContinue(List<List<double>> m, double h) =>
+    h <= 0 ? copyMatrix(m) : spectralGain(m, (k) => math.exp(-h * k));
+
+List<double> _flat(List<List<double>> m) => [for (final r in m) ...r];
+
+List<List<double>> gaussianBlur(List<List<double>> m, double sigma) {
+  final rows = m.length, cols = m.first.length;
+  final rad = math.max(1, (3 * sigma).ceil());
+  final k = [for (var i = -rad; i <= rad; i++) math.exp(-(i * i) / (2 * sigma * sigma))];
+  final sum = k.reduce((a, b) => a + b);
+  for (var i = 0; i < k.length; i++) {
+    k[i] /= sum;
+  }
+  final tmp = List.generate(rows, (r) => List.generate(cols, (c) {
+        var acc = 0.0;
+        for (var i = -rad; i <= rad; i++) {
+          acc += m[r][(c + i).clamp(0, cols - 1)] * k[i + rad];
+        }
+        return acc;
+      }));
+  return List.generate(rows, (r) => List.generate(cols, (c) {
+        var acc = 0.0;
+        for (var i = -rad; i <= rad; i++) {
+          acc += tmp[(r + i).clamp(0, rows - 1)][c] * k[i + rad];
+        }
+        return acc;
+      }));
+}
+
+List<List<double>> _despike(List<List<double>> m) {
+  final med = median3x3(m);
+  final rows = m.length, cols = m.first.length;
+  final res = [for (var r = 0; r < rows; r++) [for (var c = 0; c < cols; c++) m[r][c] - med[r][c]]];
+  final sg = math.max(robustSigma(_flat(res)), 1.0);
+  return [
+    for (var r = 0; r < rows; r++)
+      [for (var c = 0; c < cols; c++) res[r][c].abs() > 3.5 * sg ? med[r][c] : m[r][c]]
+  ];
+}
+
+/// Levels each line (row) to the common median, ignoring the overall tilt.
+List<List<double>> _destripe(List<List<double>> m) {
+  final flat = removePlane(m);
+  final gm = median(_flat(flat));
+  return [
+    for (var r = 0; r < m.length; r++)
+      () {
+        final off = median(flat[r]) - gm;
+        return [for (final v in m[r]) v - off];
+      }()
+  ];
+}
+
+/// Subtracts a smooth regional field (heavy blur of the outlier-clipped data).
+List<List<double>> _background(List<List<double>> m) {
+  final all = _flat(m);
+  final med = median(all);
+  final sg = math.max(robustSigma(all), 1.0);
+  final clip = [for (final r in m) [for (final v in r) v.clamp(med - 2 * sg, med + 2 * sg).toDouble()]];
+  final sigma = math.max(2.0, math.min(m.length, m.first.length) / 4);
+  final low = gaussianBlur(clip, sigma);
+  return [
+    for (var r = 0; r < m.length; r++) [for (var c = 0; c < m.first.length; c++) m[r][c] - low[r][c] + med]
+  ];
+}
+
+List<List<double>> _bilateral(List<List<double>> m) {
+  final rows = m.length, cols = m.first.length;
+  final sr = math.max(robustSigma(_flat(m)) * 2.0, 1.0);
+  const ss = 1.2;
+  return List.generate(rows, (r) => List.generate(cols, (c) {
+        var acc = 0.0, wsum = 0.0;
+        for (var dr = -2; dr <= 2; dr++) {
+          for (var dc = -2; dc <= 2; dc++) {
+            final rr = r + dr, cc = c + dc;
+            if (rr < 0 || rr >= rows || cc < 0 || cc >= cols) continue;
+            final dv = m[rr][cc] - m[r][c];
+            final w = math.exp(-(dr * dr + dc * dc) / (2 * ss * ss)) * math.exp(-(dv * dv) / (2 * sr * sr));
+            acc += w * m[rr][cc];
+            wsum += w;
           }
         }
-      } catch (_) {}
-      await CrashGuard.mark('done');
-      _busy = false;
-    }
-  }
+        return acc / wsum;
+      }));
+}
 
-  Future<void> dispose() async {
-    await _session?.close();
-    _session = null;
-  }
-
-  // ---- helpers ---------------------------------------------------------
-  static Float32List _buildTensor((List<List<double>>, bool, bool) a) =>
-      HeatmapRenderer.toTensor(a.$1, detrend: a.$2, imagenet: a.$3);
-
-  static AiResult _decode(Float32List f, double conf, double iou, int ms) {
-    final cand = <Detection>[];
-    final best = {for (final l in labels) l: 0.0};
-    var maxScore = 0.0;
-    for (var i = 0; i < numAnchors; i++) {
-      var cls = 0;
-      var score = f[4 * numAnchors + i];
-      for (var c = 1; c < labels.length; c++) {
-        final s = f[(4 + c) * numAnchors + i];
-        if (s > score) {
-          score = s;
-          cls = c;
-        }
-      }
-      if (score.isNaN) continue;
-      if (score > maxScore) maxScore = score;
-      if (score > best[labels[cls]]!) best[labels[cls]] = score;
-      if (score < conf) continue;
-      final cx = f[i], cy = f[numAnchors + i];
-      final w = f[2 * numAnchors + i], h = f[3 * numAnchors + i];
-      cand.add(Detection(cls, labels[cls], score, cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2));
-    }
-    cand.sort((a, b) => b.confidence.compareTo(a.confidence));
-    final top = cand.length > _maxCandidates ? cand.sublist(0, _maxCandidates) : cand;
-    return AiResult(_nms(top, iou), best, maxScore: maxScore, millis: ms);
-  }
-
-  /// Per-class greedy NMS (input already sorted by confidence).
-  static List<Detection> _nms(List<Detection> d, double iouThr) {
-    final keep = <Detection>[];
-    for (final c in d) {
-      if (keep.every((k) => k.classId != c.classId || _iou(k, c) < iouThr)) keep.add(c);
-      if (keep.length >= 50) break;
-    }
-    return keep;
-  }
-
-  static double _iou(Detection a, Detection b) {
-    final ix = math.max(0.0, math.min(a.x2, b.x2) - math.max(a.x1, b.x1));
-    final iy = math.max(0.0, math.min(a.y2, b.y2) - math.max(a.y1, b.y1));
-    final inter = ix * iy;
-    final u = (a.x2 - a.x1) * (a.y2 - a.y1) + (b.x2 - b.x1) * (b.y2 - b.y1) - inter;
-    return u <= 0 ? 0 : inter / u;
-  }
+/// Analytic-signal amplitude: sqrt(gx^2 + gy^2 + gz^2). Peaks sit over the source edges/centre
+/// regardless of the polarity of the anomaly.
+List<List<double>> _analytic(List<List<double>> m) {
+  final rows = m.length, cols = m.first.length;
+  final gz = spectralGain(m, (k) => k);
+  return List.generate(rows, (r) => List.generate(cols, (c) {
+        final gx = (m[r][math.min(c + 1, cols - 1)] - m[r][math.max(c - 1, 0)]) / 2;
+        final gy = (m[math.min(r + 1, rows - 1)][c] - m[math.max(r - 1, 0)][c]) / 2;
+        return math.sqrt(gx * gx + gy * gy + gz[r][c] * gz[r][c]);
+      }));
 }
 === FILE: lib/core/theme/app_theme.dart ===
 import 'package:flutter/material.dart';
@@ -568,16 +757,30 @@ import 'package:flutter/widgets.dart';
 String tr(BuildContext c, String en, String ar) =>
     Localizations.localeOf(c).languageCode == 'ar' ? ar : en;
 === FILE: lib/features/analysis_3d/analysis_screen.dart ===
+import 'dart:async';
+import 'dart:io';
+import 'dart:ui' as ui;
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import '../../ai/findings.dart';
+import '../../core/processing/grid_math.dart';
+import '../../core/processing/health.dart';
+import '../../core/processing/pipeline.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/utils/i18n.dart';
 import '../../services/app_state.dart';
+import '../../services/storage/scan_store.dart';
 import '../../widgets/heatmap_painter.dart';
 import '../../widgets/iso_grid_painter.dart';
+import 'compare.dart';
 import 'filters.dart';
 import 'grid_processor.dart';
+import 'palettes.dart';
 import 'soil_types.dart';
 
 Color kindColor(String k) => switch (k) {
@@ -609,6 +812,33 @@ String verdictText(BuildContext c, Verdict v) => switch (v) {
       Verdict.uncertain => tr(c, 'Uncertain detection', 'كشف غير مؤكد'),
     };
 
+String shapeText(BuildContext c, String s) => switch (s) {
+      'linear' => tr(c, 'Linear', 'خطي'),
+      'planar' => tr(c, 'Planar', 'سطحي'),
+      _ => tr(c, 'Compact', 'مدمج'),
+    };
+
+String stepName(BuildContext c, ProcStep s) => switch (s) {
+      ProcStep.despike => tr(c, 'Despike', 'إزالة النبضات الشاذّة'),
+      ProcStep.destripe => tr(c, 'Destripe', 'إزالة الخطوط'),
+      ProcStep.background => tr(c, 'Background removal', 'إزالة الخلفية'),
+      ProcStep.smooth => tr(c, 'Smooth', 'تنعيم'),
+      ProcStep.edgePreserve => tr(c, 'Edge-preserving', 'تنعيم يحفظ الحواف'),
+      ProcStep.analytic => tr(c, 'Analytic signal', 'الإشارة التحليلية'),
+      ProcStep.secondDeriv => tr(c, '2nd derivative', 'المشتقة الثانية'),
+      ProcStep.upward => tr(c, 'Upward continuation', 'الاستمرار للأعلى'),
+    };
+
+double _iouF(Finding a, Finding b) {
+  double mx(double x, double y) => x > y ? x : y;
+  double mn(double x, double y) => x < y ? x : y;
+  final ix = mx(0, mn(a.c1, b.c1) - mx(a.c0, b.c0));
+  final iy = mx(0, mn(a.r1, b.r1) - mx(a.r0, b.r0));
+  final inter = ix * iy;
+  final u = (a.c1 - a.c0) * (a.r1 - a.r0) + (b.c1 - b.c0) * (b.r1 - b.r0) - inter;
+  return u <= 0 ? 0 : inter / u;
+}
+
 class AnalysisScreen extends StatefulWidget {
   const AnalysisScreen({super.key});
   @override
@@ -619,46 +849,86 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
   final s = AppState.I;
   final filters = ScanFilters();
   final hidden = <Layer>{};
+  final _viewKey = GlobalKey();
   double depth = 1, rot = 0.6;
-  bool volumetric = false, loading = false;
-  int view = 0; // 0 = 3D, 1 = 2D map, 2 = values, 3 = profile
+  bool volumetric = false, wireframe = false, autoRotate = false, aiExpanded = true;
+  Timer? _autoTimer;
+  int view = 0; // 0 3D, 1 2D map, 2 values, 3 profile, 4 depth layers, 5 compare
   int profileIdx = 0;
   bool profileRow = true;
-  List<Finding>? findings;
-  bool onnxOk = false;
-  String? onnxError;
-  String? onnxInfo;
-  bool aiExpanded = true;
 
-  Future<void> _runAi() async {
-    setState(() => loading = true);
-    final raw = s.grid.filled();
-    dynamic yolo;
-    String? err;
-    if (s.aiEnabled.value) {
-      try {
-        await s.onnx.init();
-        yolo = await s.onnx.analyze(raw,
-            confThreshold: s.aiConf.value, detrend: s.aiDetrend.value, imagenet: s.aiImageNet.value);
-      } catch (e) {
-        err = e.toString();
-      }
+  // caches (filters / detection are recomputed only when the inputs change)
+  String? _procKey, _findKey, _layKey;
+  List<List<double>> _proc = const [];
+  List<Finding> _finds = const [];
+  List<List<List<double>>> _layers = const [];
+
+  @override
+  void dispose() {
+    _autoTimer?.cancel();
+    super.dispose();
+  }
+
+  void _toggleAuto() {
+    setState(() => autoRotate = !autoRotate);
+    _autoTimer?.cancel();
+    if (autoRotate) {
+      _autoTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
+        if (mounted && view == 0) setState(() => rot += 0.012);
+      });
     }
+  }
+
+  void _snack(String t) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+
+  // ------------------------------------------------------------- data
+  List<List<double>> _procMatrix() {
+    final key = '${s.grid.version}|${s.steps.value.map((e) => e.index).join(',')}';
+    if (key != _procKey) {
+      var base = s.grid.filled();
+      try {
+        base = applySteps(base, s.steps.value);
+      } catch (_) {
+        // a failing step must never break the screen: fall back to the unfiltered data
+      }
+      _proc = base;
+      _procKey = key;
+    }
+    return _proc;
+  }
+
+  List<Finding> _findings(List<List<double>> m, {String tag = 'scan'}) {
+    final key = '$tag|$_procKey|${s.thresholdNt.value}|${s.soil.value}|${s.ntPerCount.value}|'
+        '${s.refDepthCm.value}|${s.refAmpNt.value}|${s.grid.spacingCm}|${m.length}x${m.first.length}';
+    if (tag == 'scan' && key == _findKey) return _finds;
     final f = buildFindings(
-      m: raw,
+      m: m,
       spacingCm: s.grid.spacingCm,
       thrCounts: s.thresholdNt.value / s.ntPerCount.value,
       soilFactor: soilTypes[s.soil.value].factor,
-      yolo: yolo,
+      ntPerCount: s.ntPerCount.value,
+      refDepthCm: s.refDepthCm.value,
+      refAmpNt: s.refAmpNt.value,
     );
-    if (!mounted) return;
-    setState(() {
-      findings = f;
-      onnxOk = yolo != null;
-      onnxError = err;
-      onnxInfo = yolo == null ? null : 'max ${(yolo.maxScore * 100).round()}% • ${yolo.millis} ms';
-      loading = false;
-    });
+    if (tag == 'scan') {
+      _finds = f;
+      _findKey = key;
+    }
+    return f;
+  }
+
+  List<List<List<double>>> _depthLayers(List<List<double>> proc) {
+    if (_layKey != _procKey) {
+      _layers = [proc, upwardContinue(proc, 2), upwardContinue(proc, 4)];
+      _layKey = _procKey;
+    }
+    return _layers;
+  }
+
+  ScanStats _stats(List<List<double>> m) {
+    final flat = [for (final r in m) ...r];
+    return ScanStats(flat.reduce((a, b) => a < b ? a : b), flat.reduce((a, b) => a + b) / flat.length,
+        flat.reduce((a, b) => a > b ? a : b));
   }
 
   String _layerName(BuildContext c, Layer l) => switch (l) {
@@ -669,11 +939,24 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
         Layer.metals => tr(c, 'Metals', 'معادن'),
       };
 
+  // ------------------------------------------------------------ build
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: Text(tr(context, '3D / 4D Analysis', 'تحليل 3D / 4D')),
+        actions: [
+          IconButton(
+            tooltip: tr(context, 'Report', 'التقرير'),
+            icon: const Icon(Icons.assignment_outlined),
+            onPressed: () => _showReport(context),
+          ),
+          IconButton(
+            tooltip: tr(context, 'Share image', 'مشاركة صورة'),
+            icon: const Icon(Icons.ios_share),
+            onPressed: _exportPng,
+          ),
+        ],
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(56),
           child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
@@ -694,47 +977,32 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
         ),
       ),
       body: ListenableBuilder(
-        listenable: s.grid,
+        listenable: Listenable.merge([
+          s.grid, s.steps, s.palette, s.reversePalette, s.soil, s.thresholdNt,
+          s.ntPerCount, s.refDepthCm, s.refAmpNt, s.reference
+        ]),
         builder: (_, __) {
           final has = s.grid.hasData;
-          final (m, factor) = applyFilters(s.grid.filled(), filters);
+          final proc = _procMatrix();
+          final (m, factor) = applyFilters(proc, filters);
           final noRot = filters.rotation % 4 == 0;
-          final fl = noRot ? (findings ?? const <Finding>[]) : const <Finding>[];
+          final fl = noRot ? _findings(proc) : const <Finding>[];
+          final pst = _stats(m);
           return Column(children: [
-            ValueListenableBuilder<String?>(
-              valueListenable: s.crashStage,
-              builder: (_, st, __) => st == null
-                  ? const SizedBox.shrink()
-                  : MaterialBanner(
-                      backgroundColor: TM.navySurface,
-                      leading: const Icon(Icons.warning_amber, color: TM.gold),
-                      content: Text(tr(context,
-                          'The AI model crashed last time at: $st. Rule-based detection is on.',
-                          'انهار نموذج الذكاء آخر مرة عند: $st. الكشف بالقواعد مفعّل.')),
-                      actions: [
-                        TextButton(
-                          onPressed: () => Clipboard.setData(ClipboardData(text: 'AI crash stage: $st')),
-                          child: Text(tr(context, 'Copy', 'نسخ')),
-                        ),
-                        TextButton(
-                          onPressed: () {
-                            s.aiEnabled.value = true;
-                            s.crashStage.value = null;
-                          },
-                          child: Text(tr(context, 'Try again', 'حاول مجددًا')),
-                        ),
-                      ],
-                    ),
-            ),
             Expanded(
-              child: Stack(children: [
-                _body(context, m, factor, fl),
-                if (!has) _empty(context),
-                if (view <= 1)
-                  PositionedDirectional(end: 8, top: 8, width: 160, child: _aiCard(context)),
-              ]),
+              child: RepaintBoundary(
+                key: _viewKey,
+                child: Container(
+                  color: TM.navy,
+                  child: Stack(children: [
+                    _body(context, proc, m, factor, fl),
+                    if (!has) _empty(context),
+                    if (view <= 1 && has) PositionedDirectional(end: 8, top: 8, width: 160, child: _aiCard(context, fl)),
+                  ]),
+                ),
+              ),
             ),
-            _bottomPanel(context),
+            _bottomPanel(context, pst),
           ]);
         },
       ),
@@ -742,24 +1010,30 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
   }
 
   // ---------------------------------------------------------------- views
-  Widget _body(BuildContext context, List<List<double>> m, int factor, List<Finding> fl) {
+  Widget _body(BuildContext context, List<List<double>> proc, List<List<double>> m, int factor, List<Finding> fl) {
+    final pal = s.palette.value, rev = s.reversePalette.value;
+    final rtl = Directionality.of(context) == TextDirection.rtl;
     switch (view) {
       case 1:
         return CustomPaint(
           size: Size.infinite,
-          painter: HeatmapPainter(Directionality.of(context) == TextDirection.rtl, m, [
+          painter: HeatmapPainter(rtl, m, [
             for (final f in fl)
               HeatBox(
                 Rect.fromLTRB(f.c0 * factor, f.r0 * factor, f.c1 * factor, f.r1 * factor),
                 '${kindName(context, f.kind)} ${(f.confidence * 100).round()}%',
                 kindColor(f.kind),
               )
-          ]),
+          ], palette: pal, reverse: rev),
         );
       case 2:
         return _valuesView(m);
       case 3:
-        return _profileView(context);
+        return _profileView(context, proc);
+      case 4:
+        return _layersView(context, proc);
+      case 5:
+        return _compareView(context, proc);
       default:
         final top = fl.isEmpty ? null : fl.first;
         return GestureDetector(
@@ -771,6 +1045,9 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
                 volumetric: volumetric,
                 rotation: rot,
                 hidden: hidden,
+                palette: pal,
+                reverse: rev,
+                wireframe: wireframe,
                 highlight: top == null
                     ? null
                     : Rect.fromLTRB(top.c0 * factor, top.r0 * factor, top.c1 * factor, top.r1 * factor)),
@@ -795,9 +1072,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
       );
 
   Widget _valuesView(List<List<double>> m) {
-    final flat = m.expand((r) => r).toList();
-    final st = ScanStats(flat.reduce((a, b) => a < b ? a : b), flat.reduce((a, b) => a + b) / flat.length,
-        flat.reduce((a, b) => a > b ? a : b));
+    final scale = ColorScale(s.palette.value, s.reversePalette.value, _stats(m));
     return InteractiveViewer(
       constrained: false,
       minScale: 0.5,
@@ -813,7 +1088,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
                   Container(
                     height: 26,
                     alignment: Alignment.center,
-                    color: jetRelativeColor(v, st).withOpacity(0.75),
+                    color: scale.colorOf(v).withOpacity(0.75),
                     child: Text(v.round().toString(),
                         style: const TextStyle(fontSize: 10, color: Colors.black, fontWeight: FontWeight.w600)),
                   ),
@@ -824,14 +1099,12 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
     );
   }
 
-  Widget _profileView(BuildContext context) {
+  Widget _profileView(BuildContext context, List<List<double>> mat) {
     final g = s.grid;
-    final mat = g.filled();
     final n = profileRow ? g.rows : g.cols;
     final idx = profileIdx.clamp(0, n - 1);
     final vals = profileRow ? mat[idx] : [for (final r in mat) r[idx]];
-    final flat = mat.expand((r) => r).toList()..sort();
-    final normal = flat[flat.length ~/ 2];
+    final normal = median([for (final r in mat) ...r]);
     final thr = s.thresholdNt.value / s.ntPerCount.value;
     return Column(children: [
       Padding(
@@ -865,18 +1138,176 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
     ]);
   }
 
+  Widget _layersView(BuildContext context, List<List<double>> proc) {
+    final ls = _depthLayers(proc);
+    final names = [
+      tr(context, 'Surface', 'السطح'),
+      tr(context, 'Middle (×2)', 'المتوسط (×2)'),
+      tr(context, 'Deep (×4)', 'العميق (×4)'),
+    ];
+    final rtl = Directionality.of(context) == TextDirection.rtl;
+    return Column(children: [
+      for (var i = 0; i < 3; i++)
+        Expanded(
+          child: Stack(children: [
+            CustomPaint(
+                size: Size.infinite,
+                painter: HeatmapPainter(rtl, ls[i], const [], palette: s.palette.value, reverse: s.reversePalette.value)),
+            PositionedDirectional(
+              start: 10, top: 4,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(color: TM.navy.withOpacity(0.8), borderRadius: BorderRadius.circular(8)),
+                child: Text(names[i], style: const TextStyle(fontSize: 12, color: TM.gold)),
+              ),
+            ),
+          ]),
+        ),
+    ]);
+  }
+
+  // ------------------------------------------------------------ compare
+  Future<void> _importReference() async {
+    try {
+      final res = await FilePicker.platform.pickFiles(type: FileType.any);
+      final path = res?.files.single.path;
+      if (path == null) return;
+      final m = await ScanStore.readMatrixFile(path);
+      final med = median([for (final r in m) ...r.where((v) => !v.isNaN)]);
+      s.reference.value = [for (final r in m) [for (final v in r) v.isNaN ? med : v]];
+    } catch (e) {
+      _snack('Import failed: $e');
+    }
+  }
+
+  void _simulate({bool asScan = false}) {
+    var sigma = 12.0;
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, set) => AlertDialog(
+          title: Text(tr(ctx, 'Simulated survey', 'مسح محاكى')),
+          content: Column(mainAxisSize: MainAxisSize.min, children: [
+            Text('${tr(ctx, 'Noise σ', 'الضجيج σ')}: ${sigma.round()}'),
+            Slider(value: sigma, min: 1, max: 60, onChanged: (v) => set(() => sigma = v)),
+            Text(tr(ctx, 'Known metal, void and rock targets are generated.', 'تُولَّد أهداف معروفة (معدن وفراغ وصخر).'),
+                style: const TextStyle(fontSize: 12, color: TM.grey)),
+          ]),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: Text(tr(ctx, 'Cancel', 'إلغاء'))),
+            FilledButton(
+              onPressed: () {
+                final sim = simulateReference(
+                    rows: s.grid.rows, cols: s.grid.cols, sigma: sigma, seed: DateTime.now().millisecondsSinceEpoch % 1000);
+                if (asScan) {
+                  s.grid.loadMatrix(sim);
+                } else {
+                  s.reference.value = sim;
+                }
+                Navigator.pop(ctx);
+              },
+              child: Text(asScan ? tr(ctx, 'Use as scan', 'استخدم كمسح') : tr(ctx, 'Use as reference', 'استخدم كمرجع')),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _compareView(BuildContext context, List<List<double>> proc) {
+    final ref = s.reference.value;
+    if (ref == null) {
+      return Center(
+        child: Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              const Icon(Icons.compare, size: 40, color: TM.cyan),
+              const SizedBox(height: 8),
+              Text(tr(context, 'Compare with a reference', 'المقارنة مع مرجع'), style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              Text(tr(context, 'A reference scan (CSV / JSON) or a simulated survey with known targets.',
+                      'مسح مرجعي (CSV / JSON) أو مسح محاكى بأهداف معروفة.'),
+                  textAlign: TextAlign.center, style: const TextStyle(color: TM.grey, fontSize: 12)),
+              const SizedBox(height: 12),
+              FilledButton.icon(onPressed: _importReference, icon: const Icon(Icons.upload_file), label: Text(tr(context, 'Import reference', 'استيراد مرجع'))),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(onPressed: () => _simulate(), icon: const Icon(Icons.science), label: Text(tr(context, 'Simulate reference', 'محاكاة مرجع'))),
+              TextButton(onPressed: () => _simulate(asScan: true), child: Text(tr(context, 'Load a simulated survey as the scan', 'تحميل مسح محاكى كمسح حالي'))),
+            ]),
+          ),
+        ),
+      );
+    }
+    final rows = proc.length, cols = proc.first.length;
+    final res = compareMatrices(proc, ref);
+    final fs = _findings(proc);
+    final fr = buildFindings(
+      m: resampleTo(ref, rows, cols),
+      spacingCm: s.grid.spacingCm,
+      thrCounts: s.thresholdNt.value / s.ntPerCount.value,
+      soilFactor: soilTypes[s.soil.value].factor,
+    );
+    final matched = fr.where((r) => fs.any((x) => x.kind == r.kind && _iouF(x, r) > 0.25)).length;
+    final extra = fs.where((x) => !fr.any((r) => r.kind == x.kind && _iouF(x, r) > 0.25)).length;
+    final rtl = Directionality.of(context) == TextDirection.rtl;
+    final c = res.corr;
+    return Column(children: [
+      Expanded(
+        child: Stack(children: [
+          CustomPaint(
+              size: Size.infinite,
+              painter: HeatmapPainter(rtl, res.diff, const [], palette: s.palette.value, reverse: s.reversePalette.value)),
+          PositionedDirectional(
+            start: 10, top: 4,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              decoration: BoxDecoration(color: TM.navy.withOpacity(0.8), borderRadius: BorderRadius.circular(8)),
+              child: Text(tr(context, 'Difference: scan − reference', 'الفرق: المسح − المرجع'), style: const TextStyle(fontSize: 12, color: TM.gold)),
+            ),
+          ),
+        ]),
+      ),
+      Padding(
+        padding: const EdgeInsets.all(8),
+        child: Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                _stat(context, tr(context, 'Correlation', 'الارتباط'), c.toStringAsFixed(2), c > 0.8 ? TM.cyan : (c > 0.5 ? TM.gold : TM.hot)),
+                _stat(context, 'RMSE', '${res.rmse.toStringAsFixed(1)}', Colors.white),
+                _stat(context, tr(context, 'Targets matched', 'أهداف مطابقة'), '$matched/${fr.length}', matched == fr.length ? TM.cyan : TM.gold),
+                _stat(context, tr(context, 'Extra', 'زائدة'), '$extra', extra == 0 ? TM.cyan : TM.gold),
+              ]),
+              Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+                TextButton(onPressed: _importReference, child: Text(tr(context, 'Change', 'تغيير'))),
+                TextButton(onPressed: () => _simulate(), child: Text(tr(context, 'Simulate', 'محاكاة'))),
+                TextButton(onPressed: () => s.reference.value = null, child: Text(tr(context, 'Clear', 'مسح'))),
+              ]),
+            ]),
+          ),
+        ),
+      ),
+    ]);
+  }
+
+  Widget _stat(BuildContext context, String label, String value, Color color) => Expanded(
+        child: Column(children: [
+          Text(value, style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: color)),
+          Text(label, textAlign: TextAlign.center, style: const TextStyle(fontSize: 11, color: TM.grey)),
+        ]),
+      );
+
   // ------------------------------------------------------------ AI card
-  /// Top-3 class distribution of the strongest target (like "Metal 85 / Void 10 / Rock 5").
   List<MapEntry<String, double>> _dist(List<Finding> fl) {
     if (fl.isEmpty) return const [];
-    final p = fl.first.probs;
-    if (p.length <= 1) return [for (final f in fl.take(3)) MapEntry(f.kind, f.confidence)];
-    final l = p.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+    final l = fl.first.probs.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
     return l.take(3).toList();
   }
 
-  Widget _aiCard(BuildContext context) {
-    final fl = findings;
+  Widget _aiCard(BuildContext context, List<Finding> fl) {
+    final dist = _dist(fl);
     return Container(
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
@@ -895,112 +1326,251 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
           ),
         ]),
         const SizedBox(height: 6),
-        if (loading) const LinearProgressIndicator(),
-        if (!aiExpanded && fl != null)
-          Text('${fl.length} ${tr(context, 'detections', 'كشوفات')}', style: const TextStyle(color: TM.gold)),
-        if (aiExpanded && fl != null && !loading) ...[
-          Row(children: [
-            Icon(!s.aiEnabled.value || onnxOk ? Icons.check_circle : Icons.error_outline, size: 14,
-                color: !s.aiEnabled.value || onnxOk ? TM.cyan : TM.gold),
-            const SizedBox(width: 4),
-            Expanded(
-              child: GestureDetector(
-                onTap: onnxError == null ? null : () => _showError(context),
-                child: Text(
-                  !s.aiEnabled.value
-                      ? tr(context, 'Smart engine', 'المحرك الذكي')
-                      : (onnxOk
-                          ? '${tr(context, 'Smart engine + neural model', 'المحرك الذكي + النموذج العصبي')}${onnxInfo == null ? '' : '\n$onnxInfo'}'
-                          : tr(context, 'Neural model failed (tap: error)', 'فشل النموذج العصبي (اضغط للخطأ)')),
-                  style: TextStyle(fontSize: 11, color: !s.aiEnabled.value || onnxOk ? TM.grey : TM.gold),
-                ),
-              ),
-            ),
-          ]),
-          const SizedBox(height: 4),
+        if (!aiExpanded) Text('${fl.length} ${tr(context, 'detections', 'كشوفات')}', style: const TextStyle(color: TM.gold)),
+        if (aiExpanded) ...[
           if (fl.isEmpty)
             Text(tr(context, 'No anomaly detected', 'لا توجد شاذّة'), style: const TextStyle(color: TM.grey)),
-          for (final e in _dist(fl).asMap().entries) ...[
+          for (final e in dist.asMap().entries) ...[
             Text('${kindName(context, e.value.key)}: ${(e.value.value * 100).round()}%',
                 style: TextStyle(fontWeight: FontWeight.bold, color: e.key == 0 ? TM.gold : Colors.white)),
             Padding(
               padding: const EdgeInsets.only(top: 2, bottom: 6),
-              child: LinearProgressIndicator(value: e.value.value, minHeight: 6, color: kindColor(e.value.key), backgroundColor: Colors.white12),
+              child: LinearProgressIndicator(
+                  value: e.value.value, minHeight: 6, color: kindColor(e.value.key), backgroundColor: Colors.white12),
             ),
           ],
-        ],
-        if (aiExpanded) const SizedBox(height: 2),
-        if (aiExpanded)
-        Row(children: [
-          Expanded(
-            child: FilledButton.icon(
-              onPressed: loading || !s.grid.hasData ? null : _runAi,
-              icon: const Icon(Icons.bolt, size: 18),
-              label: Text(tr(context, 'Analyze', 'تحليل')),
+          Row(children: [
+            Expanded(
+              child: Text(
+                fl.isEmpty ? '' : '${fl.length} ${tr(context, 'targets', 'أهداف')}',
+                style: const TextStyle(fontSize: 12, color: TM.grey),
+              ),
             ),
-          ),
-          if (fl != null && fl.isNotEmpty)
             IconButton(
-              tooltip: tr(context, 'Detections list', 'قائمة الكشوفات'),
-              onPressed: () => _showList(context, fl),
-              icon: Badge(label: Text('${fl.length}'), child: const Icon(Icons.list_alt, color: TM.gold)),
+              tooltip: tr(context, 'Report', 'التقرير'),
+              onPressed: () => _showReport(context),
+              icon: Badge(label: Text('${fl.length}'), isLabelVisible: fl.isNotEmpty, child: const Icon(Icons.list_alt, color: TM.gold)),
             ),
-        ]),
+          ]),
+        ],
       ]),
     );
   }
 
-  void _showError(BuildContext context) {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(tr(ctx, 'AI model error', 'خطأ نموذج الذكاء')),
-        content: SingleChildScrollView(child: SelectableText(onnxError ?? '')),
-        actions: [
-          TextButton(
-            onPressed: () => Clipboard.setData(ClipboardData(text: onnxError ?? '')),
-            child: Text(tr(ctx, 'Copy', 'نسخ')),
-          ),
-          TextButton(onPressed: () => Navigator.pop(ctx), child: Text(tr(ctx, 'Close', 'إغلاق'))),
-        ],
-      ),
-    );
-  }
+  // -------------------------------------------------------------- report
+  String _gradeText(BuildContext c, String g) => switch (g) {
+        'E' => tr(c, 'Excellent', 'ممتاز'),
+        'G' => tr(c, 'Good', 'جيد'),
+        'F' => tr(c, 'Fair', 'مقبول'),
+        _ => tr(c, 'Poor — rescan', 'ضعيف — أعد المسح'),
+      };
 
-  void _showList(BuildContext context, List<Finding> fl) {
+  Color _gradeColor(String g) => switch (g) {
+        'E' => TM.cyan,
+        'G' => const Color(0xFF66BB6A),
+        'F' => TM.gold,
+        _ => TM.hot,
+      };
+
+  String _metricName(BuildContext c, String k) => switch (k) {
+        'coverage' => tr(c, 'Grid coverage', 'تغطية الشبكة'),
+        'saturation' => tr(c, 'Saturation-free', 'خلو من التشبع'),
+        'purity' => tr(c, 'Signal purity', 'نقاء الإشارة'),
+        'coherence' => tr(c, 'Line coherence', 'تماسك الخطوط'),
+        'background' => tr(c, 'Background stability', 'ثبات الخلفية'),
+        _ => tr(c, 'Spatial support', 'الدعم المكاني'),
+      };
+
+  String _issueText(BuildContext c, String k, HealthReport h) => switch (k) {
+        'dg1' => tr(c, '${h.unscanned} cells were not scanned. Complete the grid.', 'هناك ${h.unscanned} خلية لم تُمسح. أكمل الشبكة.'),
+        'dg2' => tr(c, '${h.saturated} saturated readings: the sensor was out of range.', '${h.saturated} قراءة مشبعة: الحساس خارج المدى.'),
+        'dg3' => tr(c, 'Impulse noise (spikes): apply Despike.', 'ضجيج نبضي: طبّق إزالة النبضات الشاذّة.'),
+        'dg4' => tr(c, 'Offsets between lines (striping): apply Destripe.', 'فروق بين الخطوط: طبّق إزالة الخطوط.'),
+        'dg5' => tr(c, 'Background drift: apply Background removal or recalibrate.', 'انجراف في الخلفية: طبّق إزالة الخلفية أو أعد المعايرة.'),
+        'dg6' => tr(c, 'Spacing above 40 cm may miss small targets.', 'مسافة أكبر من 40 سم قد تفوّت الأهداف الصغيرة.'),
+        _ => tr(c, 'No problems found.', 'لا توجد مشكلات.'),
+      };
+
+  void _showReport(BuildContext context) {
+    final proc = _procMatrix();
+    final fl = _findings(proc);
+    final h = computeHealth(
+      raw: s.grid.matrix,
+      spacingCm: s.grid.spacingCm,
+      thrCounts: s.thresholdNt.value / s.ntPerCount.value,
+    );
     showModalBottomSheet(
       context: context,
       backgroundColor: TM.navySurface,
       isScrollControlled: true,
       builder: (ctx) => DraggableScrollableSheet(
         expand: false,
-        initialChildSize: 0.6,
-        maxChildSize: 0.9,
+        initialChildSize: 0.75,
+        maxChildSize: 0.95,
         builder: (_, sc) => ListView(controller: sc, padding: const EdgeInsets.all(16), children: [
-          Text('${tr(ctx, 'Detections', 'الكشوفات')} (${fl.length})', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          Row(children: [
+            Expanded(child: Text(tr(ctx, 'Scan health', 'صحة المسح'), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold))),
+            Chip(
+              label: Text('${_gradeText(ctx, h.grade)} • ${(h.score * 100).round()}%',
+                  style: const TextStyle(color: TM.navy, fontWeight: FontWeight.bold)),
+              backgroundColor: _gradeColor(h.grade),
+            ),
+          ]),
           const SizedBox(height: 8),
+          for (final e in h.metrics.entries)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 3),
+              child: Row(children: [
+                SizedBox(width: 150, child: Text(_metricName(ctx, e.key), style: const TextStyle(fontSize: 13))),
+                Expanded(
+                  child: LinearProgressIndicator(
+                    value: e.value.clamp(0.0, 1.0).toDouble(),
+                    minHeight: 8,
+                    color: e.value > 0.7 ? TM.cyan : (e.value > 0.4 ? TM.gold : TM.hot),
+                    backgroundColor: Colors.white12,
+                  ),
+                ),
+                SizedBox(width: 40, child: Text(' ${(e.value * 100).round()}%', style: const TextStyle(fontSize: 12))),
+              ]),
+            ),
+          const SizedBox(height: 8),
+          for (final k in h.issues)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Icon(k == 'dg0' ? Icons.check_circle : Icons.info_outline, size: 18, color: k == 'dg0' ? TM.cyan : TM.gold),
+                const SizedBox(width: 8),
+                Expanded(child: Text(_issueText(ctx, k, h), style: const TextStyle(fontSize: 13))),
+              ]),
+            ),
+          const Divider(height: 28),
+          Row(children: [
+            Expanded(child: Text('${tr(ctx, 'Targets', 'الأهداف')} (${fl.length})', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold))),
+            TextButton.icon(
+              onPressed: fl.isEmpty ? null : () => _exportLog(fl),
+              icon: const Icon(Icons.ios_share, size: 18),
+              label: Text(tr(ctx, 'Export log', 'تصدير السجل')),
+            ),
+          ]),
+          if (fl.isEmpty) Text(tr(ctx, 'No anomaly detected', 'لا توجد شاذّة'), style: const TextStyle(color: TM.grey)),
           for (final f in fl)
             Card(
               child: ListTile(
-                leading: CircleAvatar(backgroundColor: kindColor(f.kind), child: Text('${(f.confidence * 100).round()}', style: const TextStyle(color: TM.navy, fontWeight: FontWeight.bold, fontSize: 12))),
+                leading: CircleAvatar(
+                    backgroundColor: kindColor(f.kind),
+                    child: Text('${(f.confidence * 100).round()}', style: const TextStyle(color: TM.navy, fontWeight: FontWeight.bold, fontSize: 12))),
                 title: Text('${kindName(ctx, f.kind)} • ${verdictText(ctx, f.verdict)}'),
-                subtitle: Text(
-                  '${tr(ctx, 'Size', 'الحجم')}: ${f.widthCm.round()}×${f.lengthCm.round()} cm\n'
-                  '${tr(ctx, 'Est. depth', 'العمق التقريبي')}: ${f.depthM.toStringAsFixed(2)} m  '
-                  '(${tr(ctx, soilTypes[s.soil.value].en, soilTypes[s.soil.value].ar)})\n'
-                  '${tr(ctx, 'Source', 'المصدر')}: ${f.source == 'AI' ? tr(ctx, 'Neural model', 'النموذج العصبي') : tr(ctx, 'Smart engine', 'المحرك الذكي')}',
-                ),
                 isThreeLine: true,
+                subtitle: Text(
+                  '${tr(ctx, 'Size', 'الحجم')}: ${f.widthCm.round()}×${f.lengthCm.round()} cm • ${shapeText(ctx, f.shape)}\n'
+                  '${tr(ctx, 'Est. depth', 'العمق التقريبي')}: ${f.depthM.toStringAsFixed(2)} m '
+                  '(${tr(ctx, soilTypes[s.soil.value].en, soilTypes[s.soil.value].ar)})'
+                  '${f.edgeCut ? '\n⚠ ${tr(ctx, 'Cut by the scan edge', 'مقطوع بحافة المسح')}' : ''}'
+                  '${f.lowRes ? '\n⚠ ${tr(ctx, 'Below scan resolution', 'أصغر من دقة المسح')}' : ''}\n'
+                  '${(f.probs.entries.toList()..sort((a, b) => b.value.compareTo(a.value))).take(3).map((e) => '${kindName(ctx, e.key)} ${(e.value * 100).round()}%').join(' • ')}',
+                ),
               ),
             ),
-          Text(tr(ctx, 'Depth and size are rough estimates; confirm in the field.', 'العمق والحجم تقديران تقريبيان؛ تحقق منهما ميدانيًا.'),
+          const SizedBox(height: 8),
+          Text(tr(ctx, 'Depth and size are rough estimates; confirm them in the field.', 'العمق والحجم تقديران تقريبيان؛ تحقق منهما ميدانيًا.'),
               style: const TextStyle(color: TM.grey, fontSize: 12)),
         ]),
       ),
     );
   }
 
-  // ------------------------------------------------------- bottom panel
+  Future<void> _exportLog(List<Finding> fl) async {
+    try {
+      final sb = StringBuffer(
+          'kind,confidence,verdict,width_cm,length_cm,depth_m,shape,peak_counts,row0,col0,row1,col1,edge_cut,low_res\n');
+      for (final f in fl) {
+        sb.writeln('${f.kind},${f.confidence.toStringAsFixed(2)},${f.verdict.name},${f.widthCm.round()},'
+            '${f.lengthCm.round()},${f.depthM.toStringAsFixed(2)},${f.shape},${f.peakDelta.toStringAsFixed(1)},'
+            '${f.r0.toStringAsFixed(0)},${f.c0.toStringAsFixed(0)},${f.r1.toStringAsFixed(0)},${f.c1.toStringAsFixed(0)},'
+            '${f.edgeCut},${f.lowRes}');
+      }
+      final dir = await getTemporaryDirectory();
+      final path = p.join(dir.path, 'terramag_targets_${DateTime.now().millisecondsSinceEpoch}.csv');
+      await File(path).writeAsString(sb.toString());
+      await Share.shareXFiles([XFile(path)], text: 'TerraMag targets');
+    } catch (e) {
+      _snack('Export failed: $e');
+    }
+  }
+
+  Future<void> _exportPng() async {
+    try {
+      final b = _viewKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
+      if (b == null) return;
+      final img = await b.toImage(pixelRatio: 2.0);
+      final bytes = await img.toByteData(format: ui.ImageByteFormat.png);
+      if (bytes == null) return;
+      final dir = await getTemporaryDirectory();
+      final path = p.join(dir.path, 'terramag_view_${DateTime.now().millisecondsSinceEpoch}.png');
+      await File(path).writeAsBytes(bytes.buffer.asUint8List());
+      await Share.shareXFiles([XFile(path)], text: 'TerraMag');
+    } catch (e) {
+      _snack('Export failed: $e');
+    }
+  }
+
+  // ------------------------------------------------------------- sheets
+  void _showFilters(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: TM.navySurface,
+      isScrollControlled: true,
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.all(16),
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(tr(ctx, 'Processing filters', 'فلاتر المعالجة'), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            Text(tr(ctx, 'Applied in order, on a copy: your recorded data is never changed.', 'تُطبَّق بالترتيب على نسخة: بياناتك المسجَّلة لا تتغير.'),
+                style: const TextStyle(fontSize: 12, color: TM.grey)),
+            const SizedBox(height: 10),
+            Wrap(spacing: 8, runSpacing: 4, children: [
+              for (final st in ProcStep.values)
+                ActionChip(label: Text(stepName(ctx, st)), avatar: const Icon(Icons.add, size: 16), onPressed: () => s.addStep(st)),
+            ]),
+            const SizedBox(height: 12),
+            Text(tr(ctx, 'Applied filters', 'الفلاتر المطبّقة'), style: const TextStyle(color: TM.cyan, fontWeight: FontWeight.bold)),
+            ValueListenableBuilder<List<ProcStep>>(
+              valueListenable: s.steps,
+              builder: (_, list, __) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                if (list.isEmpty) Text(tr(ctx, 'None', 'لا يوجد'), style: const TextStyle(color: TM.grey)),
+                for (var i = 0; i < list.length; i++) Text('${i + 1}. ${stepName(ctx, list[i])}'),
+                const SizedBox(height: 8),
+                Row(children: [
+                  OutlinedButton.icon(onPressed: list.isEmpty ? null : s.undoStep, icon: const Icon(Icons.undo), label: Text(tr(ctx, 'Undo', 'تراجع'))),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(onPressed: list.isEmpty ? null : s.clearSteps, icon: const Icon(Icons.clear_all), label: Text(tr(ctx, 'Clear all', 'مسح الكل'))),
+                ]),
+                const SizedBox(height: 8),
+                FilledButton.icon(
+                  onPressed: list.isEmpty ? null : () => _saveModified(ctx),
+                  icon: const Icon(Icons.save_as),
+                  label: Text(tr(ctx, 'Save modified copy', 'حفظ نسخة معدّلة')),
+                ),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _saveModified(BuildContext ctx) async {
+    final g = GridProcessor(rows: s.grid.rows, cols: s.grid.cols, spacingCm: s.grid.spacingCm);
+    g.loadMatrix(_procMatrix(), spacing: s.grid.spacingCm);
+    final name = '${await ScanStore.I.nextName()}_mod';
+    await ScanStore.I.save(name, g);
+    if (ctx.mounted) {
+      Navigator.pop(ctx);
+      _snack('${tr(ctx, 'Saved', 'تم الحفظ')}: $name');
+    }
+  }
+
   void _pickSoil(BuildContext context) {
     showDialog(
       context: context,
@@ -1019,7 +1589,6 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
                   onTap: () {
                     s.soil.value = i;
                     Navigator.pop(ctx);
-                    setState(() {});
                   },
                 ),
             ]),
@@ -1029,7 +1598,40 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
     );
   }
 
-  Widget _bottomPanel(BuildContext context) {
+  void _pickPalette(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, set) => SimpleDialog(
+          title: Text(tr(ctx, 'Colour palette', 'لوحة الألوان')),
+          children: [
+            for (final pid in PaletteId.values)
+              ListTile(
+                dense: true,
+                leading: Icon(pid == s.palette.value ? Icons.radio_button_checked : Icons.radio_button_off, color: TM.cyan),
+                title: Text(paletteName(ctx, pid, (en, ar) => tr(ctx, en, ar))),
+                onTap: () {
+                  s.palette.value = pid;
+                  set(() {});
+                },
+              ),
+            SwitchListTile(
+              dense: true,
+              title: Text(tr(ctx, 'Reverse', 'عكس الألوان')),
+              value: s.reversePalette.value,
+              onChanged: (v) {
+                s.reversePalette.value = v;
+                set(() {});
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // -------------------------------------------------------- bottom panel
+  Widget _bottomPanel(BuildContext context, ScanStats st) {
     Widget chip(String label, bool on, VoidCallback tap, {IconData? icon}) => Padding(
           padding: const EdgeInsets.symmetric(horizontal: 4),
           child: FilterChip(
@@ -1041,7 +1643,11 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
             checkmarkColor: TM.cyan,
           ),
         );
-    final st = s.grid.stats;
+    Widget action(String label, IconData icon, VoidCallback tap) => Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: ActionChip(avatar: Icon(icon, size: 16), label: Text(label), onPressed: tap),
+        );
+    final scale = ColorScale(s.palette.value, s.reversePalette.value, st);
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
       decoration: BoxDecoration(
@@ -1052,74 +1658,168 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
         Directionality(
           textDirection: TextDirection.ltr,
           child: Row(children: [
-          Text('${st.min.round()}', style: const TextStyle(fontSize: 11, color: TM.grey)),
-          const SizedBox(width: 6),
-          Expanded(
-            child: Container(
-              height: 8,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(4),
-                gradient: const LinearGradient(colors: [
-                  Color(0xFF0000FF), Color(0xFF00FFFF), Color(0xFF00FF00), Color(0xFFFFFF00), Color(0xFFFF0000)
-                ]),
+            Text('${st.min.round()}', style: const TextStyle(fontSize: 11, color: TM.grey)),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Container(
+                height: 8,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(4),
+                  gradient: LinearGradient(colors: scale.legendColors()),
+                ),
               ),
             ),
-          ),
-          const SizedBox(width: 6),
-          Text('${st.max.round()}', style: const TextStyle(fontSize: 11, color: TM.grey)),
-        ])),
-        const SizedBox(height: 6),
-        Row(children: [
-          Expanded(
-            child: SegmentedButton<int>(
-              showSelectedIcon: false,
-              segments: const [
-                ButtonSegment(value: 0, icon: Icon(Icons.view_in_ar, size: 18), label: Text('3D')),
-                ButtonSegment(value: 1, icon: Icon(Icons.grid_on, size: 18), label: Text('2D')),
-                ButtonSegment(value: 2, icon: Icon(Icons.pin, size: 18), label: Text('123')),
-                ButtonSegment(value: 3, icon: Icon(Icons.show_chart, size: 18), label: Text('Y')),
-              ],
-              selected: {view},
-              onSelectionChanged: (v) => setState(() => view = v.first),
-            ),
-          ),
-          const SizedBox(width: 8),
-          ActionChip(
-            avatar: const Icon(Icons.terrain, size: 16),
-            label: Text(tr(context, soilTypes[s.soil.value].en, soilTypes[s.soil.value].ar)),
-            onPressed: () => _pickSoil(context),
-          ),
-        ]),
-        if (view == 0)
-          Row(children: [
-            const Icon(Icons.layers, color: TM.cyan),
-            Expanded(child: Slider(value: depth, min: 0.2, max: 2, onChanged: (v) => setState(() => depth = v))),
-            Text(tr(context, 'Volumetric', 'حجمي')),
-            Switch(value: volumetric, onChanged: (v) => setState(() => volumetric = v)),
+            const SizedBox(width: 6),
+            Text('${st.max.round()}', style: const TextStyle(fontSize: 11, color: TM.grey)),
           ]),
-        if (view <= 2)
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(children: [
+        ),
+        const SizedBox(height: 6),
+        SegmentedButton<int>(
+          showSelectedIcon: false,
+          segments: const [
+            ButtonSegment(value: 0, icon: Icon(Icons.view_in_ar, size: 20), tooltip: '3D'),
+            ButtonSegment(value: 1, icon: Icon(Icons.grid_on, size: 20), tooltip: '2D'),
+            ButtonSegment(value: 2, icon: Icon(Icons.pin, size: 20), tooltip: '123'),
+            ButtonSegment(value: 3, icon: Icon(Icons.show_chart, size: 20), tooltip: 'Profile'),
+            ButtonSegment(value: 4, icon: Icon(Icons.layers, size: 20), tooltip: 'Layers'),
+            ButtonSegment(value: 5, icon: Icon(Icons.compare, size: 20), tooltip: 'Compare'),
+          ],
+          selected: {view},
+          onSelectionChanged: (v) => setState(() => view = v.first),
+        ),
+        const SizedBox(height: 4),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(children: [
+            action(tr(context, soilTypes[s.soil.value].en, soilTypes[s.soil.value].ar), Icons.terrain, () => _pickSoil(context)),
+            action(paletteName(context, s.palette.value, (en, ar) => tr(context, en, ar)), Icons.palette, () => _pickPalette(context)),
+            action('${tr(context, 'Filters', 'فلاتر')}${s.steps.value.isEmpty ? '' : ' (${s.steps.value.length})'}', Icons.tune, () => _showFilters(context)),
+            if (view == 0) ...[
+              chip(tr(context, 'Volumetric', 'حجمي'), volumetric, () => setState(() => volumetric = !volumetric), icon: Icons.blur_on),
+              chip(tr(context, 'Wireframe', 'شبكي'), wireframe, () => setState(() => wireframe = !wireframe), icon: Icons.grid_4x4),
+              chip(tr(context, 'Auto-rotate', 'دوران تلقائي'), autoRotate, _toggleAuto, icon: Icons.threed_rotation),
+              PopupMenuButton<double>(
+                tooltip: tr(context, 'Camera', 'الكاميرا'),
+                onSelected: (v) => setState(() => rot = v),
+                itemBuilder: (_) => [
+                  PopupMenuItem(value: 0.0, child: Text(tr(context, 'Front', 'أمامي'))),
+                  PopupMenuItem(value: 1.5708, child: Text(tr(context, 'Side', 'جانبي'))),
+                  PopupMenuItem(value: 0.6, child: Text(tr(context, 'Angled', 'مائل'))),
+                  PopupMenuItem(value: 3.1416, child: Text(tr(context, 'Back', 'خلفي'))),
+                ],
+                child: Chip(avatar: const Icon(Icons.videocam, size: 16), label: Text(tr(context, 'Camera', 'الكاميرا'))),
+              ),
+            ],
+            if (view <= 2) ...[
               chip(tr(context, 'Error Correction', 'تصحيح الأخطاء'), filters.errorCorrection,
                   () => setState(() => filters.errorCorrection = !filters.errorCorrection), icon: Icons.healing),
               chip(tr(context, 'Interpolation', 'استيفاء'), filters.interpolation,
-                  () => setState(() => filters.interpolation = !filters.interpolation), icon: Icons.blur_on),
+                  () => setState(() => filters.interpolation = !filters.interpolation), icon: Icons.blur_circular),
               chip(tr(context, 'Signal Correction', 'تصحيح الإشارة'), filters.signalCorrection,
                   () => setState(() => filters.signalCorrection = !filters.signalCorrection), icon: Icons.show_chart),
               chip(tr(context, 'Subdivision', 'تقسيم'), filters.subdivision,
                   () => setState(() => filters.subdivision = !filters.subdivision), icon: Icons.grid_view),
               chip('${tr(context, 'Rotation', 'تدوير')} ${filters.rotation % 4 * 90}°', filters.rotation % 4 != 0,
                   () => setState(() => filters.rotation = (filters.rotation + 1) % 4), icon: Icons.rotate_90_degrees_cw),
-            ]),
-          ),
+            ],
+          ]),
+        ),
+        if (view == 0)
+          Row(children: [
+            const Icon(Icons.height, color: TM.cyan),
+            Expanded(child: Slider(value: depth, min: 0.2, max: 2, onChanged: (v) => setState(() => depth = v))),
+            Text(tr(context, 'Z scale', 'تكبير Z')),
+          ]),
       ]),
     );
   }
 }
+=== FILE: lib/features/analysis_3d/compare.dart ===
+import 'dart:math' as math;
+import '../../core/processing/grid_math.dart';
+
+/// Bilinear resampling to a new size (so a reference of another size can be compared).
+List<List<double>> resampleTo(List<List<double>> m, int rows, int cols) {
+  final r0 = m.length, c0 = m.first.length;
+  if (r0 == rows && c0 == cols) return copyMatrix(m);
+  return List.generate(rows, (r) {
+    final fy = rows == 1 ? 0.0 : r * (r0 - 1) / (rows - 1);
+    final iy = fy.floor().clamp(0, r0 - 1), iy1 = math.min(iy + 1, r0 - 1);
+    final ty = fy - iy;
+    return List.generate(cols, (c) {
+      final fx = cols == 1 ? 0.0 : c * (c0 - 1) / (cols - 1);
+      final ix = fx.floor().clamp(0, c0 - 1), ix1 = math.min(ix + 1, c0 - 1);
+      final tx = fx - ix;
+      return (m[iy][ix] * (1 - tx) + m[iy][ix1] * tx) * (1 - ty) + (m[iy1][ix] * (1 - tx) + m[iy1][ix1] * tx) * ty;
+    });
+  });
+}
+
+double _gauss(math.Random r) {
+  final u = 1 - r.nextDouble(), v = r.nextDouble();
+  return math.sqrt(-2 * math.log(u)) * math.cos(2 * math.pi * v);
+}
+
+/// Synthetic reference survey with a few known targets and Gaussian noise [sigma] (counts).
+/// Handy for testing the filters and the detector against a "ground truth".
+List<List<double>> simulateReference({
+  required int rows,
+  required int cols,
+  required double sigma,
+  int seed = 1,
+  double base = 505,
+}) {
+  final rnd = math.Random(seed);
+  final specs = <List<double>>[
+    // cx, cy, spread, amplitude
+    [0.25 + rnd.nextDouble() * 0.5, 0.2 + rnd.nextDouble() * 0.2, 0.06, 280 + rnd.nextDouble() * 80],
+    [0.2 + rnd.nextDouble() * 0.2, 0.6 + rnd.nextDouble() * 0.25, 0.08, -(170 + rnd.nextDouble() * 70)],
+    [0.6 + rnd.nextDouble() * 0.25, 0.6 + rnd.nextDouble() * 0.25, 0.12, 110 + rnd.nextDouble() * 50],
+  ];
+  return List.generate(rows, (r) {
+    return List.generate(cols, (c) {
+      final x = cols == 1 ? 0.0 : c / (cols - 1), y = rows == 1 ? 0.0 : r / (rows - 1);
+      var v = base;
+      for (final t in specs) {
+        final d2 = (x - t[0]) * (x - t[0]) + (y - t[1]) * (y - t[1]);
+        v += t[3] * math.exp(-d2 / (2 * t[2] * t[2]));
+      }
+      return (v + sigma * _gauss(rnd)).clamp(0.0, 1023.0).toDouble();
+    });
+  });
+}
+
+class CompareResult {
+  final List<List<double>> diff; // scan - reference (after levelling)
+  final double corr; // Pearson correlation
+  final double rmse; // counts
+  const CompareResult(this.diff, this.corr, this.rmse);
+}
+
+CompareResult compareMatrices(List<List<double>> scan, List<List<double>> ref) {
+  final rows = scan.length, cols = scan.first.length;
+  final r = resampleTo(ref, rows, cols);
+  final ms = median([for (final x in scan) ...x]), mr = median([for (final x in r) ...x]);
+  final diff = [for (var i = 0; i < rows; i++) [for (var j = 0; j < cols; j++) (scan[i][j] - ms) - (r[i][j] - mr)]];
+  final a = [for (final x in scan) ...x], b = [for (final x in r) ...x];
+  final ma = a.reduce((p, q) => p + q) / a.length, mb = b.reduce((p, q) => p + q) / b.length;
+  double sab = 0, saa = 0, sbb = 0, se = 0;
+  for (var i = 0; i < a.length; i++) {
+    sab += (a[i] - ma) * (b[i] - mb);
+    saa += (a[i] - ma) * (a[i] - ma);
+    sbb += (b[i] - mb) * (b[i] - mb);
+  }
+  for (final row in diff) {
+    for (final d in row) {
+      se += d * d;
+    }
+  }
+  final corr = (saa <= 0 || sbb <= 0) ? 0.0 : sab / math.sqrt(saa * sbb);
+  return CompareResult(diff, corr, math.sqrt(se / a.length));
+}
 === FILE: lib/features/analysis_3d/filters.dart ===
 import 'dart:math' as math;
-import '../../ai/heatmap_renderer.dart';
+import '../../core/processing/grid_math.dart';
 
 /// The five filter chips of the 3D/4D screen.
 class ScanFilters {
@@ -1135,7 +1835,7 @@ class ScanFilters {
   var m = input;
   var factor = 1;
   if (f.errorCorrection) m = _clip(m);
-  if (f.signalCorrection) m = HeatmapRenderer.removePlane(m);
+  if (f.signalCorrection) m = removePlane(m);
   if (f.interpolation) {
     m = _upsample(m, 2, true);
     factor = 2;
@@ -1163,7 +1863,7 @@ List<List<double>> _upsample(List<List<double>> m, int k, bool cubic) {
     final fy = ((y + 0.5) / k - 0.5).clamp(0.0, rows - 1.0).toDouble();
     return List.generate(cols * k, (x) {
       final fx = ((x + 0.5) / k - 0.5).clamp(0.0, cols - 1.0).toDouble();
-      if (cubic) return HeatmapRenderer.bicubic(m, fy, fx);
+      if (cubic) return bicubic(m, fy, fx);
       final iy = fy.floor(), ix = fx.floor();
       final iy1 = math.min(iy + 1, rows - 1), ix1 = math.min(ix + 1, cols - 1);
       final ty = fy - iy, tx = fx - ix;
@@ -1196,6 +1896,8 @@ class GridProcessor extends ChangeNotifier {
   bool snake, startRight;
   late List<List<double>> matrix;
   int _cursor = 0;
+  int version = 0; // bumped on every change (cache key for the analysis)
+  final List<(int, int)> _hist = []; // recorded cells, for undo
 
   GridProcessor({
     required this.rows,
@@ -1207,9 +1909,16 @@ class GridProcessor extends ChangeNotifier {
     _alloc();
   }
 
+  @override
+  void notifyListeners() {
+    version++;
+    super.notifyListeners();
+  }
+
   void _alloc() {
     matrix = List.generate(rows, (_) => List.filled(cols, double.nan));
     _cursor = 0;
+    _hist.clear();
   }
 
   void reset() {
@@ -1234,14 +1943,33 @@ class GridProcessor extends ChangeNotifier {
   double get fieldWidthM => cols * spacingCm / 100;
   double get fieldHeightM => rows * spacingCm / 100;
 
-  void addReading(int value) {
-    if (isComplete) return;
-    final r = _cursor ~/ cols;
-    var c = _cursor % cols;
+  int get cursor => _cursor;
+  int get currentLine => math.min(_cursor ~/ cols + 1, rows);
+
+  /// Cell (row, col) that the next reading will fill.
+  (int, int) get nextCell {
+    final i = math.min(_cursor, total - 1);
+    final r = i ~/ cols;
+    var c = i % cols;
     final reverse = snake ? (r.isOdd != startRight) : startRight;
     if (reverse) c = cols - 1 - c;
-    matrix[r][c] = value.toDouble();
+    return (r, c);
+  }
+
+  void addReading(double value) {
+    if (isComplete) return;
+    final (r, c) = nextCell;
+    matrix[r][c] = value;
+    _hist.add((r, c));
     _cursor++;
+    notifyListeners();
+  }
+
+  void undoLast() {
+    if (_hist.isEmpty) return;
+    final (r, c) = _hist.removeLast();
+    matrix[r][c] = double.nan;
+    _cursor = math.max(0, _cursor - 1);
     notifyListeners();
   }
 
@@ -1251,6 +1979,7 @@ class GridProcessor extends ChangeNotifier {
     matrix = [for (final r in m) List<double>.from(r)];
     if (spacing != null) spacingCm = spacing;
     _cursor = cursor ?? rows * cols;
+    _hist.clear();
     notifyListeners();
   }
 
@@ -1335,6 +2064,69 @@ Layer layerOf(double v, ScanStats s) {
   if (v < (a[3] + a[4]) / 2) return Layer.minerals;
   return Layer.metals;
 }
+=== FILE: lib/features/analysis_3d/palettes.dart ===
+import 'package:flutter/material.dart';
+import 'grid_processor.dart';
+
+enum PaletteId { magnetic, jet, hot, viridis, rainbow, electric }
+
+const _stops = <PaletteId, List<List<double>>>{
+  PaletteId.jet: [[0, 0, 1], [0, 1, 1], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+  PaletteId.hot: [[0, 0, 0], [0.9, 0, 0], [1, 0.8, 0], [1, 1, 1]],
+  PaletteId.viridis: [
+    [0.267, 0.005, 0.329], [0.231, 0.318, 0.545], [0.128, 0.567, 0.551], [0.369, 0.789, 0.383], [0.993, 0.906, 0.144]
+  ],
+  PaletteId.rainbow: [
+    [0.5, 0, 0.8], [0, 0, 1], [0, 0.8, 1], [0, 0.9, 0.2], [1, 1, 0], [1, 0.5, 0], [1, 0, 0]
+  ],
+  PaletteId.electric: [[0, 0, 0], [0.1, 0.1, 0.5], [0.5, 0.1, 0.7], [1, 0.5, 0.1], [1, 1, 0.8]],
+};
+
+Color _lerpStops(List<List<double>> s, double t) {
+  final pos = t.clamp(0.0, 1.0) * (s.length - 1);
+  final i = pos.floor().clamp(0, s.length - 2);
+  final f = pos - i;
+  double mix(int k) => s[i][k] + (s[i + 1][k] - s[i][k]) * f;
+  return Color.fromRGBO((mix(0) * 255).round(), (mix(1) * 255).round(), (mix(2) * 255).round(), 1);
+}
+
+/// Maps a data value to a colour for the chosen palette.
+/// `magnetic` = data-relative Jet anchored on min / avg / max (default).
+class ColorScale {
+  final PaletteId id;
+  final bool reverse;
+  final ScanStats stats;
+  const ColorScale(this.id, this.reverse, this.stats);
+
+  Color colorOf(double v) {
+    final lo = stats.min, hi = stats.max;
+    if (id == PaletteId.magnetic) {
+      return jetRelativeColor(reverse ? lo + hi - v : v, stats);
+    }
+    final span = (hi - lo).abs() < 1e-9 ? 1.0 : hi - lo;
+    var t = ((v - lo) / span).clamp(0.0, 1.0);
+    if (reverse) t = 1 - t;
+    return _lerpStops(_stops[id]!, t);
+  }
+
+  List<Color> legendColors() {
+    if (id == PaletteId.magnetic) {
+      const base = [Color(0xFF0000FF), Color(0xFF00FFFF), Color(0xFF00FF00), Color(0xFFFFFF00), Color(0xFFFF0000)];
+      return reverse ? base.reversed.toList() : base;
+    }
+    final lo = stats.min, hi = stats.max;
+    return [for (var i = 0; i < 9; i++) colorOf(lo + (hi - lo) * i / 8)];
+  }
+}
+
+String paletteName(BuildContext c, PaletteId p, String Function(String, String) t) => switch (p) {
+      PaletteId.magnetic => t('Default', 'افتراضي'),
+      PaletteId.jet => 'Jet',
+      PaletteId.hot => 'Hot',
+      PaletteId.viridis => 'Viridis',
+      PaletteId.rainbow => t('Rainbow', 'قوس قزح'),
+      PaletteId.electric => 'Electric',
+    };
 === FILE: lib/features/analysis_3d/soil_types.dart ===
 /// Soil presets used by the depth estimate. The factors are rough, empirical
 /// multipliers (1.0 = neutral) - calibrate them against your own field tests.
@@ -1553,30 +2345,36 @@ class _Tile extends StatelessWidget {
 }
 === FILE: lib/features/connect/settings_sheet.dart ===
 import 'package:flutter/material.dart';
+import '../../ai/findings.dart';
+import '../../core/processing/health.dart';
+import '../../core/processing/pipeline.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/utils/i18n.dart';
 import '../../services/app_state.dart';
+import '../analysis_3d/grid_processor.dart';
 
 void showQuickManual(BuildContext context) {
   final steps = [
     ('1', tr(context, 'Power on the sensor and press Auto-Reconnect (or pick it from the list).',
         'شغّل الجهاز ثم اضغط إعادة الاتصال التلقائي أو اخترْه من القائمة.')),
-    ('2', tr(context, 'Open Live Scan, hold the sensor away from metal and tap Smart Calibrate.',
+    ('2', tr(context, 'Open Live Scan, keep the sensor away from metal and tap Smart Calibrate.',
         'افتح المسح المباشر وأبعد الجهاز عن المعادن ثم اضغط المعايرة الذكية.')),
     ('3', tr(context, 'Set the grid (start point, pattern, 30/40 cm) with the grid button.',
         'اضبط الشبكة (نقطة البداية والنمط و30/40 سم) من زر الشبكة.')),
-    ('4', tr(context, 'Walk the grid and tap RECORD POINT at each station.',
-        'امشِ على الشبكة واضغط تسجيل نقطة عند كل محطة.')),
-    ('5', tr(context, 'Open 3D/4D, apply filters and run the AI analysis.',
-        'افتح تحليل 3D/4D وطبّق الفلاتر ثم شغّل تحليل الذكاء الاصطناعي.')),
-    ('6', tr(context, 'Save the scan in Files; export to CSV or share it.',
-        'احفظ المسح في الملفات وصدّره بصيغة CSV أو شاركه.')),
+    ('4', tr(context, 'Walk the grid and tap RECORD at each point, or switch on Smart capture to record when steady.',
+        'امشِ على الشبكة واضغط تسجيل عند كل نقطة، أو فعّل التسجيل الذكي ليسجّل عند الثبات.')),
+    ('5', tr(context, 'Open 3D/4D: switch views (3D, 2D, values, profile, depth layers, compare) and pick a palette.',
+        'افتح تحليل 3D/4D: بدّل العروض (ثلاثي، ثنائي، قيم، مقطع، طبقات العمق، مقارنة) واختر لوحة ألوان.')),
+    ('6', tr(context, 'Use Filters to clean the data, then open the Report for scan health and the target list.',
+        'استخدم الفلاتر لتنظيف البيانات ثم افتح التقرير لصحة المسح وقائمة الأهداف.')),
+    ('7', tr(context, 'Save the scan in Files; export to CSV, share, or share the view as an image.',
+        'احفظ المسح في الملفات وصدّره CSV أو شاركه، أو شارك العرض كصورة.')),
   ];
   showDialog(
     context: context,
     builder: (ctx) => AlertDialog(
       title: Row(children: [
-        const Icon(Icons.picture_as_pdf, color: TM.gold),
+        const Icon(Icons.menu_book, color: TM.gold),
         const SizedBox(width: 8),
         Text(tr(ctx, 'Quick Manual', 'دليل سريع')),
       ]),
@@ -1596,14 +2394,58 @@ void showQuickManual(BuildContext context) {
   );
 }
 
+/// Runs every filter, the health report and the detector on a demo survey and reports problems.
+void _selfTest(BuildContext context) {
+  final lines = <String>[];
+  final g = GridProcessor(rows: 16, cols: 16)..fillDemo();
+  final m = g.filled();
+  for (final st in ProcStep.values) {
+    try {
+      final r = applyStep(m, st);
+      final ok = r.length == 16 && r.every((row) => row.length == 16 && row.every((v) => v.isFinite));
+      lines.add('${ok ? '✓' : '✗'} ${st.name}');
+    } catch (e) {
+      lines.add('✗ ${st.name}: $e');
+    }
+  }
+  try {
+    final h = computeHealth(raw: g.matrix, spacingCm: 30, thrCounts: 50);
+    lines.add('✓ health: ${h.grade} ${(h.score * 100).round()}%');
+  } catch (e) {
+    lines.add('✗ health: $e');
+  }
+  try {
+    final f = buildFindings(m: m, spacingCm: 30, thrCounts: 50, soilFactor: 1);
+    lines.add('${f.length >= 2 ? '✓' : '✗'} detector: ${f.length} targets');
+  } catch (e) {
+    lines.add('✗ detector: $e');
+  }
+  final allOk = lines.every((l) => l.startsWith('✓'));
+  showDialog(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(allOk ? tr(ctx, 'Self-test passed', 'نجح الفحص الذاتي') : tr(ctx, 'Self-test found problems', 'الفحص الذاتي وجد مشكلات')),
+      content: SingleChildScrollView(child: Text(lines.join('\n'))),
+      actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: Text(tr(ctx, 'Close', 'إغلاق')))],
+    ),
+  );
+}
+
 void showSettingsSheet(BuildContext context) {
   final s = AppState.I;
+  final dCtl = TextEditingController(text: s.refDepthCm.value > 0 ? s.refDepthCm.value.toStringAsFixed(0) : '');
+  final aCtl = TextEditingController(text: s.refAmpNt.value > 0 ? s.refAmpNt.value.toStringAsFixed(0) : '');
+  void applyCal() {
+    s.refDepthCm.value = double.tryParse(dCtl.text.trim()) ?? 0;
+    s.refAmpNt.value = double.tryParse(aCtl.text.trim()) ?? 0;
+  }
+
   showModalBottomSheet(
     context: context,
     backgroundColor: TM.navySurface,
     isScrollControlled: true,
     builder: (ctx) => Padding(
-      padding: const EdgeInsets.all(20),
+      padding: EdgeInsets.fromLTRB(20, 20, 20, 20 + MediaQuery.of(ctx).viewInsets.bottom),
       child: SingleChildScrollView(
         child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text(tr(ctx, 'Settings', 'الإعدادات'), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
@@ -1621,6 +2463,15 @@ void showSettingsSheet(BuildContext context) {
               title: Text(tr(ctx, 'Audio feedback', 'التنبيه الصوتي')),
               value: v,
               onChanged: (x) => s.audioOn.value = x,
+            ),
+          ),
+          ValueListenableBuilder<bool>(
+            valueListenable: s.vibrateOn,
+            builder: (_, v, __) => SwitchListTile(
+              secondary: const Icon(Icons.vibration),
+              title: Text(tr(ctx, 'Vibration', 'الاهتزاز')),
+              value: v,
+              onChanged: (x) => s.vibrateOn.value = x,
             ),
           ),
           ValueListenableBuilder<bool>(
@@ -1645,47 +2496,38 @@ void showSettingsSheet(BuildContext context) {
           const Divider(),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-            child: Text(tr(ctx, 'AI options', 'خيارات الذكاء الاصطناعي'), style: const TextStyle(fontWeight: FontWeight.bold, color: TM.cyan)),
+            child: Text(tr(ctx, 'Depth calibration (optional)', 'معايرة العمق (اختياري)'),
+                style: const TextStyle(fontWeight: FontWeight.bold, color: TM.cyan)),
           ),
-          ValueListenableBuilder<bool>(
-            valueListenable: s.aiEnabled,
-            builder: (_, v, __) => SwitchListTile(
-              title: Text(tr(ctx, 'Experimental: neural model (ONNX)', 'تجريبي: النموذج العصبي (ONNX)')),
-              subtitle: Text(tr(ctx, 'May crash on some phones. Off = smart engine only', 'قد ينهار على بعض الهواتف. مطفأ = المحرك الذكي فقط')),
-              value: v,
-              onChanged: (x) {
-                s.aiEnabled.value = x;
-                if (x) s.crashStage.value = null;
-              },
-            ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Text(tr(ctx, 'If you know a target\'s true depth and its amplitude, enter them so the depth estimate follows your site.',
+                    'إن عرفت العمق الحقيقي لهدف وسعة إشارته فأدخلهما ليتبع تقدير العمق موقعك.'),
+                style: const TextStyle(fontSize: 12, color: TM.grey)),
           ),
-          ValueListenableBuilder<bool>(
-            valueListenable: s.aiDetrend,
-            builder: (_, v, __) => SwitchListTile(
-              title: Text(tr(ctx, 'Remove tilt before AI', 'إزالة الميل قبل التحليل')),
-              value: v,
-              onChanged: (x) => s.aiDetrend.value = x,
-            ),
-          ),
-          ValueListenableBuilder<bool>(
-            valueListenable: s.aiImageNet,
-            builder: (_, v, __) => SwitchListTile(
-              title: Text(tr(ctx, 'ImageNet normalisation', 'تطبيع ImageNet')),
-              subtitle: Text(tr(ctx, 'Try toggling if the model finds nothing', 'جرّب تغييره إن لم يكشف النموذج شيئًا')),
-              value: v,
-              onChanged: (x) => s.aiImageNet.value = x,
-            ),
-          ),
-          ValueListenableBuilder<double>(
-            valueListenable: s.aiConf,
-            builder: (_, v, __) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: Text('${tr(ctx, 'AI confidence threshold', 'عتبة ثقة الذكاء')}: ${(v * 100).round()}%'),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+            child: Row(children: [
+              Expanded(
+                child: TextField(
+                  controller: dCtl,
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(labelText: tr(ctx, 'Known depth (cm)', 'العمق المعروف (سم)')),
+                  onChanged: (_) => applyCal(),
+                ),
               ),
-              Slider(value: v, min: 0.05, max: 0.9, onChanged: (x) => s.aiConf.value = x),
+              const SizedBox(width: 12),
+              Expanded(
+                child: TextField(
+                  controller: aCtl,
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(labelText: tr(ctx, 'At amplitude (nT)', 'عند سعة (nT)')),
+                  onChanged: (_) => applyCal(),
+                ),
+              ),
             ]),
           ),
+          const Divider(),
           ListTile(
             leading: const Icon(Icons.auto_awesome, color: TM.gold),
             title: Text(tr(ctx, 'Load demo survey', 'تحميل مسح تجريبي')),
@@ -1695,6 +2537,12 @@ void showSettingsSheet(BuildContext context) {
               Navigator.pop(ctx);
               s.tab.value = 2;
             },
+          ),
+          ListTile(
+            leading: const Icon(Icons.fact_check, color: TM.cyan),
+            title: Text(tr(ctx, 'Run self-test', 'تشغيل الفحص الذاتي')),
+            subtitle: Text(tr(ctx, 'Checks all filters, health report and detector', 'يفحص كل الفلاتر وتقرير الصحة والكاشف')),
+            onTap: () => _selfTest(ctx),
           ),
         ]),
       ),
@@ -1779,11 +2627,12 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
       final res = await FilePicker.platform.pickFiles(type: FileType.any);
       final path = res?.files.single.path;
       if (path == null) return;
-      final m = ScanStore.parseCsv(await File(path).readAsString());
+      final raw = await ScanStore.readMatrixFile(path);
+      final m = raw; // NaN cells stay "not measured"
       s.grid.loadMatrix(m);
       await store.save(p.basenameWithoutExtension(path), s.grid);
       _refresh();
-      _snack(tr(context, 'CSV imported', 'تم استيراد CSV'));
+      _snack(tr(context, 'Scan imported', 'تم استيراد المسح'));
     } catch (e) {
       _snack('Import failed: $e');
     }
@@ -1823,7 +2672,7 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                 FilledButton.icon(
                   onPressed: _import,
                   icon: const Icon(Icons.upload_file),
-                  label: Text(tr(context, 'Import CSV', 'استيراد CSV')),
+                  label: Text(tr(context, 'Import', 'استيراد')),
                 ),
               ]),
             ),
@@ -2075,8 +2924,10 @@ import '../../core/utils/i18n.dart';
 import '../../services/app_state.dart';
 import '../../services/ble/ble_service.dart';
 import '../../widgets/compass_widget.dart';
+import '../../widgets/grid_mini_map.dart';
 import '../../widgets/tech_background.dart';
 import '../../widgets/thermal_bar.dart';
+import '../../widgets/trace_chart.dart';
 import 'grid_setup_dialog.dart';
 
 class LiveScanScreen extends StatelessWidget {
@@ -2091,15 +2942,19 @@ class LiveScanScreen extends StatelessWidget {
           child: Column(children: [
             _TopBar(s),
             Expanded(
-              child: ValueListenableBuilder<int>(
-                valueListenable: s.live,
-                builder: (_, v, __) => ValueListenableBuilder<double?>(
-                  valueListenable: s.baseline,
-                  builder: (_, __, ___) => _Center(s, v),
-                ),
-              ),
+              child: ListView(padding: const EdgeInsets.fromLTRB(16, 4, 16, 8), children: [
+                _LiveSection(s),
+                const SizedBox(height: 8),
+                const TraceChart(height: 80),
+                const SizedBox(height: 8),
+                _RecordCard(s),
+                const SizedBox(height: 8),
+                GridMiniMap(grid: s.grid, height: 220),
+                const SizedBox(height: 8),
+                _ScanParams(s),
+                _ThresholdCard(s),
+              ]),
             ),
-            _ThresholdCard(s),
             _Actions(s),
             const SizedBox(height: 8),
           ]),
@@ -2143,47 +2998,67 @@ class _TopBar extends StatelessWidget {
       );
 }
 
-class _Center extends StatelessWidget {
+class _LiveSection extends StatelessWidget {
   final AppState s;
-  final int v;
-  const _Center(this.s, this.v);
+  const _LiveSection(this.s);
   @override
-  Widget build(BuildContext context) {
-    final d = s.deltaNt(v);
-    final st = s.alertState(v);
-    final alert = st != 0;
-    return Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Padding(padding: const EdgeInsets.fromLTRB(20, 12, 8, 12), child: ThermalBar(value: v)),
-      Expanded(
-        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          FittedBox(child: Text('$v', style: Theme.of(context).textTheme.displayLarge)),
-          Text(
-            s.baseline.value == null
-                ? tr(context, 'Not calibrated', 'غير معايَر')
-                : 'Δ ${d >= 0 ? '+' : ''}${d.toStringAsFixed(0)} nT',
-            style: TextStyle(fontSize: 18, color: alert ? TM.gold : TM.grey, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 8),
-          AnimatedContainer(
-            duration: const Duration(milliseconds: 150),
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-            decoration: BoxDecoration(
-              color: st > 0 ? TM.gold : (st < 0 ? TM.cyan : Colors.transparent),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: alert ? (st > 0 ? TM.gold : TM.cyan) : Colors.white24),
-            ),
-            child: Text(
-              st > 0 ? tr(context, 'METAL', 'معدن') : (st < 0 ? tr(context, 'VOID', 'فراغ') : tr(context, 'Normal', 'طبيعي')),
-              style: TextStyle(color: alert ? TM.navy : TM.grey, fontWeight: FontWeight.bold),
-            ),
-          ),
-          const SizedBox(height: 16),
-          _RecordCard(s),
-        ]),
-      ),
-      const SizedBox(width: 12),
-    ]);
-  }
+  Widget build(BuildContext context) => ListenableBuilder(
+        listenable: Listenable.merge([s.live, s.baseline, s.thresholdNt, s.ntPerCount, s.peak]),
+        builder: (_, __) {
+          final v = s.live.value;
+          final st = s.alertState(v);
+          final alert = st != 0;
+          final d = s.deltaNt(v);
+          final vec = s.ble.vectorSeen; // sensor sends nT (x,y,z)
+          final thr = s.thresholdNt.value;
+          final fraction = vec ? 0.5 + d / (8 * thr) : v / 1023;
+          final ticks = vec
+              ? ['+${(4 * thr).round()}', '+${(2 * thr).round()}', '0', '-${(2 * thr).round()}', '-${(4 * thr).round()}']
+              : ['1023', '768', '512', '256', '0'];
+          return SizedBox(
+            height: 300,
+            child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              Padding(padding: const EdgeInsets.fromLTRB(4, 8, 8, 8), child: ThermalBar(fraction: fraction, ticks: ticks)),
+              Expanded(
+                child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                  FittedBox(child: Text('${v.round()}', style: Theme.of(context).textTheme.displayLarge)),
+                  Text(
+                    s.baseline.value == null
+                        ? tr(context, 'Not calibrated', 'غير معايَر')
+                        : 'Δ ${d >= 0 ? '+' : ''}${d.toStringAsFixed(0)} nT',
+                    style: TextStyle(fontSize: 18, color: alert ? TM.gold : TM.grey, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 8),
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 150),
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: st > 0 ? TM.gold : (st < 0 ? TM.cyan : Colors.transparent),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: alert ? (st > 0 ? TM.gold : TM.cyan) : Colors.white24),
+                    ),
+                    child: Text(
+                      st > 0 ? tr(context, 'METAL', 'معدن') : (st < 0 ? tr(context, 'VOID', 'فراغ') : tr(context, 'Normal', 'طبيعي')),
+                      style: TextStyle(color: alert ? TM.navy : TM.grey, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Text('${tr(context, 'Peak', 'الذروة')}: ${s.peak.value.toStringAsFixed(0)} nT',
+                        style: const TextStyle(color: TM.grey, fontSize: 13)),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: tr(context, 'Reset peak', 'تصفير الذروة'),
+                      onPressed: s.resetPeak,
+                      icon: const Icon(Icons.restart_alt, size: 20, color: TM.cyan),
+                    ),
+                  ]),
+                ]),
+              ),
+            ]),
+          );
+        },
+      );
 }
 
 class _RecordCard extends StatelessWidget {
@@ -2194,12 +3069,21 @@ class _RecordCard extends StatelessWidget {
         listenable: s.grid,
         builder: (_, __) {
           final g = s.grid;
+          final (nr, nc) = g.nextCell;
           return Card(
             child: Padding(
               padding: const EdgeInsets.all(12),
               child: Column(children: [
-                Text('${tr(context, 'Point', 'نقطة')} ${g.captured} / ${g.total}',
-                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                Row(children: [
+                  Text('${tr(context, 'Point', 'نقطة')} ${g.captured} / ${g.total}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                  const Spacer(),
+                  Text(
+                    g.isComplete
+                        ? tr(context, 'Scan complete', 'اكتمل المسح')
+                        : '${tr(context, 'Line', 'خط')} ${g.currentLine}/${g.rows} • ${tr(context, 'next', 'التالي')}: ${nr + 1},${nc + 1}',
+                    style: const TextStyle(fontSize: 12, color: TM.grey),
+                  ),
+                ]),
                 Text('${g.rows}×${g.cols} • ${g.spacingCm} cm • ${g.fieldWidthM.toStringAsFixed(1)}×${g.fieldHeightM.toStringAsFixed(1)} m',
                     style: const TextStyle(fontSize: 11, color: TM.grey)),
                 const SizedBox(height: 6),
@@ -2214,8 +3098,25 @@ class _RecordCard extends StatelessWidget {
                       label: Text(tr(context, 'RECORD', 'تسجيل'), style: const TextStyle(fontWeight: FontWeight.bold)),
                     ),
                   ),
+                  IconButton(tooltip: tr(context, 'Undo last point', 'تراجع عن آخر نقطة'), onPressed: g.captured == 0 ? null : g.undoLast, icon: const Icon(Icons.undo, color: TM.cyan)),
                   IconButton(tooltip: tr(context, 'Grid Setup', 'إعداد الشبكة'), onPressed: () => showGridSetup(context), icon: const Icon(Icons.grid_on, color: TM.cyan)),
-                  IconButton(tooltip: tr(context, 'Reset', 'مسح'), onPressed: g.reset, icon: const Icon(Icons.delete_sweep, color: TM.grey)),
+                  IconButton(
+                    tooltip: tr(context, 'New scan', 'مسح جديد'),
+                    onPressed: () async {
+                      final ok = await showDialog<bool>(
+                        context: context,
+                        builder: (ctx) => AlertDialog(
+                          title: Text(tr(ctx, 'Clear the current scan?', 'مسح بيانات المسح الحالي؟')),
+                          actions: [
+                            TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(tr(ctx, 'Cancel', 'إلغاء'))),
+                            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: Text(tr(ctx, 'Clear', 'مسح'))),
+                          ],
+                        ),
+                      );
+                      if (ok == true) g.reset();
+                    },
+                    icon: const Icon(Icons.delete_sweep, color: TM.grey),
+                  ),
                 ]),
               ]),
             ),
@@ -2224,25 +3125,89 @@ class _RecordCard extends StatelessWidget {
       );
 }
 
+class _ScanParams extends StatelessWidget {
+  final AppState s;
+  const _ScanParams(this.s);
+  @override
+  Widget build(BuildContext context) => Card(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Column(children: [
+            ValueListenableBuilder<bool>(
+              valueListenable: s.smartCapture,
+              builder: (_, on, __) => SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                secondary: const Icon(Icons.auto_mode, color: TM.cyan),
+                title: Text(tr(context, 'Smart capture (when steady)', 'تسجيل ذكي (عند الثبات)')),
+                subtitle: ListenableBuilder(
+                  listenable: s.spread,
+                  builder: (_, __) => Text(
+                    '${tr(context, 'Spread', 'التذبذب')}: ${s.spread.value.toStringAsFixed(0)} nT • '
+                    '${s.spread.value <= s.stabNt.value ? tr(context, 'steady', 'ثابت') : tr(context, 'moving', 'متحرك')}',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                ),
+                value: on,
+                onChanged: (v) => s.smartCapture.value = v,
+              ),
+            ),
+            ValueListenableBuilder<int>(
+              valueListenable: s.pulses,
+              builder: (_, n, __) => Row(children: [
+                const Icon(Icons.stacked_line_chart, size: 20, color: TM.cyan),
+                const SizedBox(width: 12),
+                Expanded(child: Text('${tr(context, 'Readings averaged per point', 'قراءات لكل نقطة')}: $n')),
+                IconButton(onPressed: n > 1 ? () => s.pulses.value = n - 1 : null, icon: const Icon(Icons.remove_circle_outline)),
+                IconButton(onPressed: n < 10 ? () => s.pulses.value = n + 1 : null, icon: const Icon(Icons.add_circle_outline)),
+              ]),
+            ),
+            ValueListenableBuilder<double>(
+              valueListenable: s.stabNt,
+              builder: (_, v, __) => Row(children: [
+                SizedBox(width: 130, child: Text('${tr(context, 'Steady limit', 'حد الثبات')} ${v.round()} nT', style: const TextStyle(fontSize: 13))),
+                Expanded(child: Slider(value: v, min: 5, max: 100, onChanged: (x) => s.stabNt.value = x)),
+              ]),
+            ),
+            ValueListenableBuilder<double>(
+              valueListenable: s.dwellSec,
+              builder: (_, v, __) => Row(children: [
+                SizedBox(width: 130, child: Text('${tr(context, 'Hold time', 'مدة الثبات')} ${v.toStringAsFixed(1)} s', style: const TextStyle(fontSize: 13))),
+                Expanded(child: Slider(value: v, min: 0.5, max: 5, onChanged: (x) => s.dwellSec.value = x)),
+              ]),
+            ),
+            ValueListenableBuilder<bool>(
+              valueListenable: s.vibrateOn,
+              builder: (_, on, __) => SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                secondary: const Icon(Icons.vibration, color: TM.cyan),
+                title: Text(tr(context, 'Vibration feedback', 'اهتزاز عند التنبيه والتسجيل')),
+                value: on,
+                onChanged: (v) => s.vibrateOn.value = v,
+              ),
+            ),
+          ]),
+        ),
+      );
+}
+
 class _ThresholdCard extends StatelessWidget {
   final AppState s;
   const _ThresholdCard(this.s);
   @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16),
-        child: ValueListenableBuilder<double>(
-          valueListenable: s.thresholdNt,
-          builder: (_, t, __) => Column(children: [
-            Row(children: [
-              const Icon(Icons.tune, size: 18, color: TM.cyan),
-              const SizedBox(width: 6),
-              Text(tr(context, 'Threshold', 'عتبة الحساسية')),
-              const Spacer(),
-              Text('${t.round()} nT', style: const TextStyle(color: TM.gold, fontWeight: FontWeight.bold)),
-            ]),
-            Slider(value: t, min: 15, max: 200, divisions: 37, onChanged: (x) => s.thresholdNt.value = x),
+  Widget build(BuildContext context) => ValueListenableBuilder<double>(
+        valueListenable: s.thresholdNt,
+        builder: (_, t, __) => Column(children: [
+          Row(children: [
+            const Icon(Icons.tune, size: 18, color: TM.cyan),
+            const SizedBox(width: 6),
+            Text(tr(context, 'Detection threshold', 'عتبة الكشف')),
+            const Spacer(),
+            Text('${t.round()} nT', style: const TextStyle(color: TM.gold, fontWeight: FontWeight.bold)),
           ]),
-        ),
+          Slider(value: t, min: 15, max: 200, divisions: 37, onChanged: (x) => s.thresholdNt.value = x),
+        ]),
       );
 }
 
@@ -2373,20 +3338,173 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
-import '../ai/onnx_service.dart';
+import '../core/processing/pipeline.dart';
 import '../features/analysis_3d/grid_processor.dart';
+import '../features/analysis_3d/palettes.dart';
 import 'ble/ble_service.dart';
-import 'crash_guard.dart';
 import 'tone_player.dart';
+import 'trace_buffer.dart';
 
 /// App-wide singleton. Only the locale uses ChangeNotifier (root rebuild);
 /// everything that changes often uses ValueNotifier to keep rebuilds local.
 class AppState extends ChangeNotifier {
   AppState._() {
     ble.samples.listen(_onSample);
-    _checkCrash();
     grid.addListener(_persist);
     _restore();
+  }
+  static final I = AppState._();
+
+  final ble = BleService();
+  final grid = GridProcessor(rows: 16, cols: 16, spacingCm: 30);
+  final tone = TonePlayer();
+  final trace = TraceBuffer();
+
+  Locale locale = const Locale('en');
+  void toggleLocale() {
+    locale = locale.languageCode == 'en' ? const Locale('ar') : const Locale('en');
+    notifyListeners();
+  }
+
+  // ---- navigation / live values -------------------------------------------
+  final tab = ValueNotifier<int>(0);
+  final live = ValueNotifier<double>(0);
+  final baseline = ValueNotifier<double?>(null);
+  final peak = ValueNotifier<double>(0); // largest |delta| (nT) since the last reset
+  final spread = ValueNotifier<double>(0); // steadiness: spread of the last readings (nT)
+
+  // ---- scan settings ----------------------------------------------------
+  final thresholdNt = ValueNotifier<double>(50); // 15..200
+  final ntPerCount = ValueNotifier<double>(1.0); // sensor scale factor
+  final audioOn = ValueNotifier<bool>(true);
+  final vibrateOn = ValueNotifier<bool>(true);
+  final simulate = ValueNotifier<bool>(false);
+  final pulses = ValueNotifier<double>(3); // readings averaged per point (1..10)
+  final smartCapture = ValueNotifier<bool>(false); // record automatically when steady
+  final stabNt = ValueNotifier<double>(15); // steadiness limit (nT)
+  final dwellSec = ValueNotifier<double>(2); // time the reading must stay steady (s)
+
+  // ---- analysis settings ------------------------------------------------
+  final soil = ValueNotifier<int>(0); // index into soilTypes
+  final refDepthCm = ValueNotifier<double>(0); // depth calibration (0 = off)
+  final refAmpNt = ValueNotifier<double>(0);
+  final steps = ValueNotifier<List<ProcStep>>(const []); // filter history
+  final palette = ValueNotifier<PaletteId>(PaletteId.magnetic);
+  final reversePalette = ValueNotifier<bool>(false);
+  final reference = ValueNotifier<List<List<double>>?>(null); // for "Compare"
+
+  void addStep(ProcStep s) => steps.value = [...steps.value, s];
+  void undoStep() {
+    if (steps.value.isNotEmpty) steps.value = steps.value.sublist(0, steps.value.length - 1);
+  }
+
+  void clearSteps() => steps.value = const [];
+
+  // ---- live processing --------------------------------------------------
+  final List<double> _recent = [];
+  DateTime _lastBeep = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime? _steadySince;
+  DateTime _lastCapture = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _needMove = false;
+
+  double deltaNt(double v) => baseline.value == null ? 0 : (v - baseline.value!) * ntPerCount.value;
+
+  /// +1 = positive anomaly (metal), -1 = negative anomaly (void), 0 = normal.
+  int alertState(double v) {
+    if (baseline.value == null) return 0;
+    final d = deltaNt(v);
+    if (d > thresholdNt.value) return 1;
+    if (d < -thresholdNt.value) return -1;
+    return 0;
+  }
+
+  bool isAlert(double v) => alertState(v) != 0;
+
+  void _onSample(SensorSample s) {
+    final v = s.value;
+    live.value = v;
+    trace.add(v);
+    _recent.add(v);
+    if (_recent.length > 60) _recent.removeAt(0);
+
+    final n = math.max(1, pulses.value.round());
+    final win = _recent.length > n ? _recent.sublist(_recent.length - n) : _recent;
+    final sp = (win.reduce(math.max) - win.reduce(math.min)) * ntPerCount.value;
+    spread.value = sp;
+
+    if (baseline.value != null) {
+      final p = deltaNt(v).abs();
+      if (p > peak.value) peak.value = p;
+    }
+
+    final st = alertState(v);
+    final now = DateTime.now();
+    if (st != 0 && now.difference(_lastBeep).inMilliseconds > 350) {
+      _lastBeep = now;
+      if (audioOn.value) st > 0 ? tone.metal() : tone.voidTone();
+      if (vibrateOn.value) st > 0 ? HapticFeedback.heavyImpact() : HapticFeedback.selectionClick();
+    }
+
+    // smart capture: record when the reading has been steady long enough
+    if (smartCapture.value && !grid.isComplete) {
+      final steady = win.length >= n && sp <= stabNt.value;
+      if (!steady) {
+        _steadySince = null;
+        _needMove = false; // the user moved: allow the next capture
+      } else {
+        _steadySince ??= now;
+        if (now.difference(_lastCapture).inSeconds > 8) _needMove = false; // safety timeout
+        final held = now.difference(_steadySince!).inMilliseconds / 1000;
+        if (!_needMove && held >= dwellSec.value) {
+          capture();
+          _needMove = true;
+          _steadySince = null;
+        }
+      }
+    }
+  }
+
+  /// Records the average of the last [pulses] readings at the next grid cell.
+  void capture() {
+    if (grid.isComplete) return;
+    final n = math.max(1, pulses.value.round());
+    final win = _recent.length > n ? _recent.sublist(_recent.length - n) : _recent;
+    final v = win.isEmpty ? live.value : win.reduce((a, b) => a + b) / win.length;
+    grid.addReading(v);
+    _lastCapture = DateTime.now();
+    if (vibrateOn.value) HapticFeedback.lightImpact();
+  }
+
+  void zeroPoint() => baseline.value = live.value;
+  void resetPeak() => peak.value = 0;
+
+  /// Smart calibration: average ~2 s of readings and use it as the baseline.
+  Future<double?> calibrate({Duration duration = const Duration(seconds: 2)}) async {
+    final vals = <double>[];
+    final sub = ble.samples.listen((s) => vals.add(s.value));
+    await Future.delayed(duration);
+    await sub.cancel();
+    if (vals.isEmpty) return null;
+    baseline.value = vals.reduce((a, b) => a + b) / vals.length;
+    peak.value = 0;
+    return baseline.value;
+  }
+
+  // ---- sensor simulator (test the UI without hardware) ------------------
+  Timer? _sim;
+  double _t = 0;
+  void setSimulate(bool on) {
+    simulate.value = on;
+    _sim?.cancel();
+    if (!on) return;
+    final rnd = math.Random();
+    _sim = Timer.periodic(const Duration(milliseconds: 100), (_) {
+      _t += 0.1;
+      final ph = _t % 20;
+      final bump = 250 * math.exp(-math.pow(ph - 9.5, 2) / 0.6);
+      final v = 500 + 25 * math.sin(_t * 0.7) + rnd.nextInt(9) - 4 + bump;
+      ble.injectSample(v.clamp(0, 1023).toDouble());
+    });
   }
 
   // ---- the current scan survives app restarts / crashes ----------------
@@ -2417,116 +3535,18 @@ class AppState extends ChangeNotifier {
       grid.loadMatrix(m, spacing: j['spacing_cm'] as int?, cursor: j['cursor'] as int?);
     } catch (_) {}
   }
-
-  /// If the last AI run died natively, switch the neural model off and remember where.
-  Future<void> _checkCrash() async {
-    final st = await CrashGuard.previousCrashStage();
-    if (st != null) {
-      aiEnabled.value = false;
-      crashStage.value = st;
-      await CrashGuard.mark('done');
-    }
-  }
-  static final I = AppState._();
-
-  final ble = BleService();
-  final grid = GridProcessor(rows: 16, cols: 16, spacingCm: 30);
-  final onnx = OnnxService();
-
-  Locale locale = const Locale('en');
-  void toggleLocale() {
-    locale = locale.languageCode == 'en' ? const Locale('ar') : const Locale('en');
-    notifyListeners();
-  }
-
-  final tab = ValueNotifier<int>(0);
-  final live = ValueNotifier<int>(0);
-  final baseline = ValueNotifier<double?>(null);
-  final thresholdNt = ValueNotifier<double>(50); // 15..200
-  final ntPerCount = ValueNotifier<double>(1.0); // sensor scale factor
-  final audioOn = ValueNotifier<bool>(true);
-  final simulate = ValueNotifier<bool>(false);
-  final soil = ValueNotifier<int>(0); // index into soilTypes
-  final aiEnabled = ValueNotifier<bool>(false); // neural model is experimental: off by default
-  final crashStage = ValueNotifier<String?>(null);
-  final aiDetrend = ValueNotifier<bool>(true);
-  final aiImageNet = ValueNotifier<bool>(false);
-  final aiConf = ValueNotifier<double>(0.25);
-  final tone = TonePlayer();
-
-  DateTime _lastBeep = DateTime.fromMillisecondsSinceEpoch(0);
-
-  double deltaNt(int v) => baseline.value == null ? 0 : (v - baseline.value!) * ntPerCount.value;
-  /// +1 = positive anomaly (metal), -1 = negative anomaly (void), 0 = normal.
-  int alertState(int v) {
-    if (baseline.value == null) return 0;
-    final d = deltaNt(v);
-    if (d > thresholdNt.value) return 1;
-    if (d < -thresholdNt.value) return -1;
-    return 0;
-  }
-
-  bool isAlert(int v) => alertState(v) != 0;
-
-  void _onSample(SensorSample s) {
-    live.value = s.value;
-    final st = alertState(s.value);
-    if (st != 0 && audioOn.value) {
-      final now = DateTime.now();
-      if (now.difference(_lastBeep).inMilliseconds > 350) {
-        _lastBeep = now;
-        if (st > 0) {
-          tone.metal();
-          HapticFeedback.heavyImpact();
-        } else {
-          tone.voidTone();
-          HapticFeedback.selectionClick();
-        }
-      }
-    }
-  }
-
-  void capture() => grid.addReading(live.value);
-  void zeroPoint() => baseline.value = live.value.toDouble();
-
-  /// Smart calibration: average ~2 s of readings and use it as the baseline.
-  Future<double?> calibrate({Duration duration = const Duration(seconds: 2)}) async {
-    final vals = <int>[];
-    final sub = ble.samples.listen((s) => vals.add(s.value));
-    await Future.delayed(duration);
-    await sub.cancel();
-    if (vals.isEmpty) return null;
-    baseline.value = vals.reduce((a, b) => a + b) / vals.length;
-    return baseline.value;
-  }
-
-  // ---- sensor simulator (test the UI without hardware) ------------------
-  Timer? _sim;
-  double _t = 0;
-  void setSimulate(bool on) {
-    simulate.value = on;
-    _sim?.cancel();
-    if (!on) return;
-    final rnd = math.Random();
-    _sim = Timer.periodic(const Duration(milliseconds: 100), (_) {
-      _t += 0.1;
-      final ph = _t % 20;
-      final bump = 250 * math.exp(-math.pow(ph - 9.5, 2) / 0.6);
-      final v = 500 + 25 * math.sin(_t * 0.7) + rnd.nextInt(9) - 4 + bump;
-      ble.injectSample(v.clamp(0, 1023).round());
-    });
-  }
 }
 === FILE: lib/services/ble/ble_service.dart ===
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:path_provider/path_provider.dart';
 
 class SensorSample {
-  final int value; // 0..1023
+  final double value; // counts (0..1023) or nT magnitude when the sensor sends x,y,z
   final DateTime t;
   SensorSample(this.value, this.t);
 }
@@ -2534,7 +3554,8 @@ class SensorSample {
 enum BleStatus { disconnected, connecting, connected, reconnecting }
 
 /// BLE link to the ESP32 gradiometer.
-/// Protocol: ASCII lines "0..1023\r\n". Optional "BAT:87\r\n" for battery.
+/// Protocol: ASCII lines, either one number per line (e.g. 512) or "x,y,z" (nT; the field
+/// magnitude is used). Optional "BAT:87" lines report the battery.
 class BleService {
   // Nordic UART defaults. If your firmware uses other UUIDs, the service falls back
   // to the first characteristic that supports notifications.
@@ -2547,6 +3568,7 @@ class BleService {
 
   BleStatus current = BleStatus.disconnected;
   final ValueNotifier<int> battery = ValueNotifier<int>(-1);
+  bool vectorSeen = false; // true once a 'x,y,z' line was received (values are nT)
   String? connectedName;
   String? lastName;
 
@@ -2562,7 +3584,7 @@ class BleService {
   }
 
   /// Used by the built-in sensor simulator.
-  void injectSample(int v) => _samples.add(SensorSample(v, DateTime.now()));
+  void injectSample(double v) => _samples.add(SensorSample(v, DateTime.now()));
 
   // ---- scanning --------------------------------------------------------
   Stream<List<ScanResult>> get results => FlutterBluePlus.scanResults;
@@ -2659,8 +3681,17 @@ class BleService {
         battery.value = int.tryParse(line.substring(4)) ?? battery.value;
         continue;
       }
-      final v = int.tryParse(line);
-      if (v != null && v >= 0 && v <= 1023) injectSample(v);
+      final parts = line.split(RegExp(r'[,;\s]+')).where((p) => p.isNotEmpty).toList();
+      if (parts.length == 3) {
+        final x = double.tryParse(parts[0]), y = double.tryParse(parts[1]), z = double.tryParse(parts[2]);
+        if (x != null && y != null && z != null) {
+          vectorSeen = true;
+          injectSample(math.sqrt(x * x + y * y + z * z));
+        }
+      } else if (parts.length == 1) {
+        final v = double.tryParse(parts[0]);
+        if (v != null && v.isFinite) injectSample(v);
+      }
     }
   }
 
@@ -2679,35 +3710,6 @@ class BleService {
     } catch (_) {
       return null;
     }
-  }
-}
-=== FILE: lib/services/crash_guard.dart ===
-import 'dart:io';
-import 'package:path_provider/path_provider.dart';
-
-/// Native crashes cannot be caught in Dart. Before every risky native step we write its
-/// name to a file; if the app dies, the next launch reads the last stage that never finished.
-class CrashGuard {
-  static File? _f;
-  static Future<File> _file() async =>
-      _f ??= File('${(await getApplicationSupportDirectory()).path}/ai_stage.txt');
-
-  /// Stage of a previous run that did not finish (null = clean).
-  static Future<String?> previousCrashStage() async {
-    try {
-      final f = await _file();
-      if (!await f.exists()) return null;
-      final t = (await f.readAsString()).trim();
-      return (t.isEmpty || t == 'done') ? null : t;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  static Future<void> mark(String stage) async {
-    try {
-      await (await _file()).writeAsString(stage, flush: true);
-    } catch (_) {}
   }
 }
 === FILE: lib/services/storage/scan_store.dart ===
@@ -2824,6 +3826,7 @@ class ScanStore {
     return out;
   }
 
+  /// Matrix CSV (one grid row per line, empty field = not measured) or "x,y,value" triples.
   static List<List<double>> parseCsv(String text) {
     final rows = <List<double>>[];
     for (final line in const LineSplitter().convert(text)) {
@@ -2832,8 +3835,37 @@ class ScanStore {
       rows.add(t.split(RegExp(r'[,;\t]')).map((s) => double.tryParse(s.trim()) ?? double.nan).toList());
     }
     if (rows.isEmpty) throw const FormatException('Empty CSV');
+
+    // x,y,value triples: integer indices whose extent matches the number of lines
+    if (rows.length >= 4 && rows.every((r) => r.length == 3 && !r[0].isNaN && !r[1].isNaN)) {
+      final ints = rows.every((r) => r[0] == r[0].roundToDouble() && r[1] == r[1].roundToDouble() && r[0] >= 0 && r[1] >= 0);
+      if (ints) {
+        final w = rows.map((r) => r[0].toInt()).reduce((a, b) => a > b ? a : b) + 1;
+        final h = rows.map((r) => r[1].toInt()).reduce((a, b) => a > b ? a : b) + 1;
+        if (w * h == rows.length) {
+          final g = List.generate(h, (_) => List.filled(w, double.nan));
+          for (final r in rows) {
+            g[r[1].toInt()][r[0].toInt()] = r[2];
+          }
+          return g;
+        }
+      }
+    }
     final w = rows.map((r) => r.length).reduce((a, b) => a > b ? a : b);
     return [for (final r in rows) [...r, ...List.filled(w - r.length, double.nan)]];
+  }
+
+  /// Reads a scan file: our JSON format, or CSV.
+  static Future<List<List<double>>> readMatrixFile(String path) async {
+    final text = await File(path).readAsString();
+    if (path.toLowerCase().endsWith('.json')) {
+      final j = jsonDecode(text) as Map<String, dynamic>;
+      return [
+        for (final r in j['matrix'] as List)
+          [for (final v in r as List) v == null ? double.nan : (v as num).toDouble()]
+      ];
+    }
+    return parseCsv(text);
   }
 }
 === FILE: lib/services/tone_player.dart ===
@@ -2896,6 +3928,24 @@ class TonePlayer {
     return data.buffer.asUint8List();
   }
 }
+=== FILE: lib/services/trace_buffer.dart ===
+import 'package:flutter/foundation.dart';
+
+/// Ring buffer of the latest readings for the live trace chart.
+class TraceBuffer extends ChangeNotifier {
+  static const maxLen = 150;
+  final List<double> data = [];
+  void add(double v) {
+    data.add(v);
+    if (data.length > maxLen) data.removeAt(0);
+    notifyListeners();
+  }
+
+  void clear() {
+    data.clear();
+    notifyListeners();
+  }
+}
 === FILE: lib/widgets/compass_widget.dart ===
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
@@ -2952,11 +4002,70 @@ class _CompassPainter extends CustomPainter {
   @override
   bool shouldRepaint(_CompassPainter o) => o.heading != heading;
 }
+=== FILE: lib/widgets/grid_mini_map.dart ===
+import 'dart:math' as math;
+import 'package:flutter/material.dart';
+import '../core/theme/app_theme.dart';
+import '../features/analysis_3d/grid_processor.dart';
+import '../features/analysis_3d/palettes.dart';
+
+/// Live map of the scan grid: measured cells are coloured, the next cell is outlined in gold.
+class GridMiniMap extends StatelessWidget {
+  final GridProcessor grid;
+  final double height;
+  const GridMiniMap({super.key, required this.grid, this.height = 220});
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+        listenable: grid,
+        builder: (_, __) => SizedBox(
+          height: height,
+          child: CustomPaint(size: Size.infinite, painter: _MapPainter(grid)),
+        ),
+      );
+}
+
+class _MapPainter extends CustomPainter {
+  final GridProcessor g;
+  _MapPainter(this.g);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rows = g.rows, cols = g.cols;
+    final cell = math.min(size.width / cols, size.height / rows);
+    final ox = (size.width - cell * cols) / 2, oy = (size.height - cell * rows) / 2;
+    final scale = ColorScale(PaletteId.magnetic, false, g.stats);
+    final fill = Paint(), line = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.6
+      ..color = Colors.white24;
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        final rect = Rect.fromLTWH(ox + c * cell, oy + r * cell, cell, cell);
+        final v = g.matrix[r][c];
+        if (!v.isNaN) {
+          fill.color = scale.colorOf(v);
+          canvas.drawRect(rect, fill);
+        }
+        canvas.drawRect(rect, line);
+      }
+    }
+    if (!g.isComplete) {
+      final (r, c) = g.nextCell;
+      canvas.drawRect(Rect.fromLTWH(ox + c * cell, oy + r * cell, cell, cell), Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.5
+        ..color = TM.gold);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _MapPainter old) => true;
+}
 === FILE: lib/widgets/heatmap_painter.dart ===
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../core/theme/app_theme.dart';
 import '../features/analysis_3d/grid_processor.dart';
+import '../features/analysis_3d/palettes.dart';
 
 class HeatBox {
   final Rect rect; // cell units of the drawn matrix
@@ -2970,19 +4079,25 @@ class HeatmapPainter extends CustomPainter {
   final bool rtl;
   final List<List<double>> m;
   final List<HeatBox> boxes;
-  HeatmapPainter(this.rtl, this.m, this.boxes);
+  final PaletteId palette;
+  final bool reverse;
+  final ScanStats? statsOverride; // e.g. symmetric range for difference maps
+  HeatmapPainter(this.rtl, this.m, this.boxes,
+      {this.palette = PaletteId.magnetic, this.reverse = false, this.statsOverride});
 
   @override
   void paint(Canvas canvas, Size size) {
     final rows = m.length, cols = m.first.length;
     final flat = m.expand((r) => r).toList();
-    final stats = ScanStats(flat.reduce(math.min), flat.reduce((a, b) => a + b) / flat.length, flat.reduce(math.max));
+    final stats = statsOverride ??
+        ScanStats(flat.reduce(math.min), flat.reduce((a, b) => a + b) / flat.length, flat.reduce(math.max));
+    final scale = ColorScale(palette, reverse, stats);
     final cell = math.min((size.width - 16) / cols, (size.height - 16) / rows);
     final ox = (size.width - cell * cols) / 2, oy = (size.height - cell * rows) / 2;
     final paint = Paint();
     for (var r = 0; r < rows; r++) {
       for (var c = 0; c < cols; c++) {
-        paint.color = jetRelativeColor(m[r][c], stats);
+        paint.color = scale.colorOf(m[r][c]);
         canvas.drawRect(Rect.fromLTWH(ox + c * cell, oy + r * cell, cell + 0.6, cell + 0.6), paint);
       }
     }
@@ -3056,6 +4171,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../core/theme/app_theme.dart';
 import '../features/analysis_3d/grid_processor.dart';
+import '../features/analysis_3d/palettes.dart';
 
 /// Isometric voxel view. Auto-fits the canvas, rotates about the vertical axis,
 /// hides layers, and outlines the AI detection in gold.
@@ -3064,15 +4180,23 @@ class IsoGridPainter extends CustomPainter {
   final double depth; // 0.2 .. 2.0
   final bool volumetric;
   final double rotation; // radians
+  final double elevation; // camera elevation in radians (~0.61 = isometric, 1.57 = top view)
   final Set<Layer> hidden;
   final Rect? highlight; // in cell units of [m]
+  final PaletteId palette;
+  final bool reverse;
+  final bool wireframe;
 
   IsoGridPainter(this.m,
       {this.depth = 1,
       this.volumetric = false,
       this.rotation = 0.6,
+      this.elevation = 0.61,
       this.hidden = const {},
-      this.highlight});
+      this.highlight,
+      this.palette = PaletteId.magnetic,
+      this.reverse = false,
+      this.wireframe = false});
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -3081,11 +4205,13 @@ class IsoGridPainter extends CustomPainter {
     final lo = flat.reduce(math.min), hi = flat.reduce(math.max);
     final stats = ScanStats(lo, flat.reduce((a, b) => a + b) / flat.length, hi);
     final span = (hi - lo).abs() < 1e-9 ? 1.0 : hi - lo;
+    final colors = ColorScale(palette, reverse, stats);
 
     final cr = math.cos(rotation), sr = math.sin(rotation);
+    final se = math.sin(elevation), ce = math.cos(elevation);
     Offset pu(double x, double y, double z) {
       final rx = x * cr - y * sr, ry = x * sr + y * cr;
-      return Offset((rx - ry) * 0.866, (rx + ry) * 0.5 - z);
+      return Offset((rx - ry) * 0.7071, (rx + ry) * 0.7071 * se - z * ce);
     }
 
     final maxH = 5.0 * depth;
@@ -3133,8 +4259,8 @@ class IsoGridPainter extends CustomPainter {
       canvas.drawPath(path, Paint()..color = color);
       canvas.drawPath(path, Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = stroke == 0 ? 0.4 : stroke
-        ..color = sc ?? Colors.black26);
+        ..strokeWidth = stroke == 0 ? (wireframe ? 0.9 : 0.4) : stroke
+        ..color = sc ?? (wireframe ? Colors.white54 : Colors.black26));
     }
 
     for (final o in order) {
@@ -3145,7 +4271,7 @@ class IsoGridPainter extends CustomPainter {
       final h = hid ? 0.1 : math.max(0.15, n * maxH);
       final base = hid
           ? Colors.blueGrey.withOpacity(0.18)
-          : jetRelativeColor(v, stats).withOpacity(volumetric ? 0.4 : 1.0);
+          : colors.colorOf(v).withOpacity(wireframe ? 0.12 : (volumetric ? 0.4 : 1.0));
       final x = c - cols / 2, y = r - rows / 2;
 
       // [x1,y1,x2,y2,nx,ny] for the 4 side faces
@@ -3288,13 +4414,14 @@ class _LogoPainter extends CustomPainter {
 import 'package:flutter/material.dart';
 import '../core/theme/app_theme.dart';
 
-/// Tall vertical thermal bar (Grey -> Gold -> Red) for a 0..1023 value, with scale ticks.
+/// Tall vertical thermal bar (Grey -> Gold -> Red). [fraction] 0..1, with scale ticks (top -> bottom).
 class ThermalBar extends StatelessWidget {
-  final int value;
-  const ThermalBar({super.key, required this.value});
+  final double fraction;
+  final List<String> ticks;
+  const ThermalBar({super.key, required this.fraction, required this.ticks});
   @override
   Widget build(BuildContext context) {
-    final t = (value / 1023).clamp(0.0, 1.0);
+    final t = fraction.clamp(0.0, 1.0).toDouble();
     return LayoutBuilder(builder: (_, c) {
       final h = c.maxHeight.isFinite ? c.maxHeight : 300.0;
       return SizedBox(
@@ -3329,79 +4456,86 @@ class ThermalBar extends StatelessWidget {
           Column(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              for (final l in ['1023', '768', '512', '256', '0'])
-                Text(l, style: const TextStyle(fontSize: 11, color: TM.grey)),
-            ],
+            children: [for (final l in ticks) Text(l, style: const TextStyle(fontSize: 11, color: TM.grey))],
           ),
         ]),
       );
     });
   }
 }
-=== FILE: tool/ci_prebuild.sh ===
-#!/usr/bin/env bash
-# Runs in CI after the Android project is generated and before the APK build.
-# Keeps working even if something here fails (the workflow marks it continue-on-error).
-cd "$(dirname "$0")/.." || exit 0
-flutter pub get > /dev/null 2>&1 || flutter pub get
+=== FILE: lib/widgets/trace_chart.dart ===
+import 'dart:math' as math;
+import 'package:flutter/material.dart';
+import '../core/theme/app_theme.dart';
+import '../services/app_state.dart';
 
-echo "=== flutter_onnxruntime version ==="
-grep -A4 "flutter_onnxruntime:" pubspec.lock | head -8
-P=$(find ~/.pub-cache -type d -name 'flutter_onnxruntime-*' 2>/dev/null | sort | tail -1)
-echo "plugin dir: $P"
+/// Live trace of the latest readings with the baseline and the detection band.
+class TraceChart extends StatelessWidget {
+  final double height;
+  const TraceChart({super.key, this.height = 80});
+  @override
+  Widget build(BuildContext context) {
+    final s = AppState.I;
+    return Container(
+      height: height,
+      decoration: BoxDecoration(
+        color: TM.navySurface.withOpacity(0.7),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: ListenableBuilder(
+          listenable: Listenable.merge([s.trace, s.baseline, s.thresholdNt, s.ntPerCount]),
+          builder: (_, __) => CustomPaint(
+            size: Size.infinite,
+            painter: _TracePainter(
+              List<double>.from(s.trace.data),
+              s.baseline.value,
+              s.thresholdNt.value / s.ntPerCount.value,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
-python3 - "$P" <<'PY'
-import sys, re, glob, os
-P = sys.argv[1]
-if not P or not os.path.isdir(P):
-    print("plugin dir not found - skipping"); sys.exit(0)
+class _TracePainter extends CustomPainter {
+  final List<double> v;
+  final double? base;
+  final double thr; // counts
+  _TracePainter(this.v, this.base, this.thr);
 
-files = glob.glob(P + '/lib/**/*.dart', recursive=True)
-src = {f: open(f, encoding='utf-8', errors='ignore').read() for f in files}
-alltxt = "\n".join(src.values())
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (v.length < 2) return;
+    var lo = v.reduce(math.min), hi = v.reduce(math.max);
+    if (base != null) {
+      lo = math.min(lo, base! - thr);
+      hi = math.max(hi, base! + thr);
+    }
+    final span = (hi - lo).abs() < 1e-9 ? 1.0 : hi - lo;
+    double y(double val) => size.height - 6 - (val - lo) / span * (size.height - 12);
+    double x(int i) => i / (v.length - 1) * size.width;
 
-def body_of(kind, name):
-    m = re.search(kind + r'\s+' + name + r'\b[^{]*\{(.*?)\n\}', alltxt, re.S)
-    return m.group(1) if m else ''
+    if (base != null) {
+      canvas.drawRect(Rect.fromLTRB(0, y(base! + thr), size.width, y(base! - thr)), Paint()..color = TM.cyan.withOpacity(0.10));
+      canvas.drawLine(Offset(0, y(base!)), Offset(size.width, y(base!)), Paint()
+        ..color = TM.grey
+        ..strokeWidth = 1);
+    }
+    final path = Path();
+    for (var i = 0; i < v.length; i++) {
+      final p = Offset(x(i), y(v[i]));
+      i == 0 ? path.moveTo(p.dx, p.dy) : path.lineTo(p.dx, p.dy);
+    }
+    canvas.drawPath(path, Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..color = TM.cyan);
+    canvas.drawCircle(Offset(x(v.length - 1), y(v.last)), 4, Paint()..color = TM.gold);
+  }
 
-opts = body_of('class', 'OrtSessionOptions')
-prov = body_of('enum', 'OrtProvider')
-sigs = re.findall(r'createSessionFromAsset\s*\(([^)]*)\)', alltxt, re.S)
-print("OrtSessionOptions fields:", re.findall(r'this\.(\w+)', opts))
-print("OrtProvider values:", re.findall(r'\b([A-Za-z_]+)\s*[,;(]', prov)[:12])
-for s in sigs: print("createSessionFromAsset(", ' '.join(s.split()), ")")
-
-can_options = any(re.search(r'OrtSessionOptions\??\s+options', s) for s in sigs)
-args = []
-if re.search(r'this\.providers', opts) and re.search(r'\bCPU\b', prov):
-    args.append('providers: [OrtProvider.CPU]')
-if re.search(r'this\.intraOpNumThreads', opts):
-    args.append('intraOpNumThreads: 2')
-
-# the class must be exported from the package's main library
-main = os.path.join(P, 'lib', 'flutter_onnxruntime.dart')
-defining = [f for f, t in src.items() if re.search(r'class\s+OrtSessionOptions\b', t)]
-exported = bool(defining) and (defining[0] == main or
-           os.path.basename(defining[0]) in open(main, encoding='utf-8', errors='ignore').read())
-
-target = 'lib/ai/onnx_service.dart'
-t = open(target, encoding='utf-8').read()
-if can_options and args and exported and '/*ORT_OPTS*/' in t:
-    t = t.replace('/*ORT_OPTS*/', ', options: OrtSessionOptions(' + ', '.join(args) + ')')
-    open(target, 'w', encoding='utf-8').write(t)
-    print("PATCHED session options:", args)
-else:
-    print("NOT patched. can_options=%s args=%s exported=%s" % (can_options, args, exported))
-PY
-
-# Give the Java heap more room (harmless safety net)
-python3 - <<'PY'
-p = 'android/app/src/main/AndroidManifest.xml'
-s = open(p, encoding='utf-8').read()
-if 'largeHeap' not in s:
-    s = s.replace('<application', '<application android:largeHeap="true"', 1)
-    open(p, 'w', encoding='utf-8').write(s)
-    print("largeHeap enabled")
-PY
-exit 0
+  @override
+  bool shouldRepaint(covariant _TracePainter old) => true;
+}
