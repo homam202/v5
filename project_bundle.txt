@@ -490,7 +490,7 @@ HealthReport computeHealth({
   final total = rows * cols;
   final measured = [for (final r in raw) ...r.where((v) => !v.isNaN)];
   final unscanned = total - measured.length;
-  final coverage = total == 0 ? 0.0 : measured.length / total;
+  final double coverage = total == 0 ? 0.0 : measured.length / total;
   if (measured.length < 6) {
     return HealthReport(
         {'coverage': coverage, 'saturation': 1, 'purity': 1, 'coherence': 1, 'background': 1, 'support': 1},
@@ -500,14 +500,14 @@ HealthReport computeHealth({
   final m = [for (final r in raw) [for (final v in r) v.isNaN ? med0 : v]];
 
   final saturated = measured.where((v) => v <= 0 || v >= satMax).length;
-  final satFree = 1 - saturated / measured.length;
+  final double satFree = (1 - saturated / measured.length).toDouble();
 
   final med3 = median3x3(m);
   final res = [for (var r = 0; r < rows; r++) [for (var c = 0; c < cols; c++) m[r][c] - med3[r][c]]];
   final sg = math.max(robustSigma([for (final r in res) ...r]), 1.0);
   final spikes = [for (final r in res) ...r].where((v) => v.abs() > 3.5 * sg).length;
   final spikeFrac = spikes / total;
-  final purity = 1 - math.min(1.0, spikeFrac * 5);
+  final double purity = (1 - math.min(1.0, spikeFrac * 5)).toDouble();
 
   final tilt = <double>[];
   final flat = removePlane(m, tilt: tilt);
@@ -520,17 +520,17 @@ HealthReport computeHealth({
   }
   final noise = math.max(robustSigma(diffs) / math.sqrt(2), 1.0); // within-row noise
   final offs = [for (final r in flat) median(r)];
-  var coherence = 1.0;
+  double coherence = 1.0;
   if (rows >= 5) {
     final d2 = [for (var i = 1; i + 1 < rows; i++) (offs[i + 1] - 2 * offs[i] + offs[i - 1]).abs()];
     final stripeSd = median(d2) * 1.4826 / math.sqrt(6);
     final expected = noise / math.sqrt(cols) * 1.25;
     final ratio = stripeSd / math.max(expected, 0.5);
-    coherence = 1 - ((ratio - 1.5) / 4).clamp(0.0, 1.0).toDouble();
+    coherence = (1 - ((ratio - 1.5) / 4).clamp(0.0, 1.0)).toDouble();
   }
 
   final drift = math.sqrt(math.pow(tilt[0] * cols, 2) + math.pow(tilt[1] * rows, 2));
-  final background = 1 - (drift / math.max(3 * thrCounts, 1)).clamp(0.0, 1.0).toDouble();
+  final double background = (1 - (drift / math.max(3 * thrCounts, 1)).clamp(0.0, 1.0)).toDouble();
 
   final normal = median([for (final r in m) ...r]);
   var anomalous = 0, supported = 0;
@@ -548,7 +548,7 @@ HealthReport computeHealth({
       if (ok) supported++;
     }
   }
-  final support = anomalous == 0 ? 1.0 : supported / anomalous;
+  final double support = anomalous == 0 ? 1.0 : supported / anomalous;
 
   final score = (1.5 * coverage + satFree + purity + coherence + background + support) / 6.5;
   final grade = score >= 0.85 ? 'E' : (score >= 0.7 ? 'G' : (score >= 0.5 ? 'F' : 'P'));
@@ -762,7 +762,7 @@ import 'dart:io';
 import 'dart:ui' as ui;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
+import 'package:flutter/rendering.dart' show RenderRepaintBoundary;
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -3379,7 +3379,7 @@ class AppState extends ChangeNotifier {
   final audioOn = ValueNotifier<bool>(true);
   final vibrateOn = ValueNotifier<bool>(true);
   final simulate = ValueNotifier<bool>(false);
-  final pulses = ValueNotifier<double>(3); // readings averaged per point (1..10)
+  final pulses = ValueNotifier<int>(3); // readings averaged per point (1..10)
   final smartCapture = ValueNotifier<bool>(false); // record automatically when steady
   final stabNt = ValueNotifier<double>(15); // steadiness limit (nT)
   final dwellSec = ValueNotifier<double>(2); // time the reading must stay steady (s)
@@ -3427,7 +3427,7 @@ class AppState extends ChangeNotifier {
     _recent.add(v);
     if (_recent.length > 60) _recent.removeAt(0);
 
-    final n = math.max(1, pulses.value.round());
+    final n = math.max(1, pulses.value);
     final win = _recent.length > n ? _recent.sublist(_recent.length - n) : _recent;
     final sp = (win.reduce(math.max) - win.reduce(math.min)) * ntPerCount.value;
     spread.value = sp;
@@ -3467,7 +3467,7 @@ class AppState extends ChangeNotifier {
   /// Records the average of the last [pulses] readings at the next grid cell.
   void capture() {
     if (grid.isComplete) return;
-    final n = math.max(1, pulses.value.round());
+    final n = math.max(1, pulses.value);
     final win = _recent.length > n ? _recent.sublist(_recent.length - n) : _recent;
     final v = win.isEmpty ? live.value : win.reduce((a, b) => a + b) / win.length;
     grid.addReading(v);
