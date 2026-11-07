@@ -14,7 +14,7 @@ jobs:
       - uses: subosito/flutter-action@v2
         with: { channel: stable, cache: true }
 
-      - name: Assemble sources and model
+      - name: Assemble sources
         run: |
           python3 - <<'PY'
           import os, re, glob
@@ -26,11 +26,8 @@ jobs:
               path = 'app/' + parts[i]
               os.makedirs(os.path.dirname(path), exist_ok=True)
               open(path, 'w', encoding='utf-8').write(parts[i + 1])
+          print('files written:', (len(parts) - 1) // 2)
           PY
-          mkdir -p app/assets/models
-          find . -name 'model_part_*' | sort
-          cat $(find . -name 'model_part_*' | sort) > app/assets/models/best2.onnx
-          ls -la app/assets/models
 
       - name: Create Android host project (keep our lib and pubspec)
         working-directory: app
@@ -58,8 +55,8 @@ jobs:
           PY
           sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/; s/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' android/app/build.gradle* || true
 
-      # Some plugins (e.g. file_picker) are compiled against an older Android API than
-      # their own dependencies require. Force every module to compile against API 36.
+      # Some plugins are compiled against an older Android API than their own dependencies
+      # require. Force every module to compile against API 36.
       - name: Force compileSdk 36 for all plugins
         run: |
           mkdir -p ~/.gradle
@@ -71,6 +68,19 @@ jobs:
               }
           }
           GRADLE
+
+      - name: Prebuild hooks (from project)
+        working-directory: app
+        continue-on-error: true
+        run: |
+          if [ -f tool/ci_prebuild.sh ]; then bash tool/ci_prebuild.sh; else echo "no hook script"; fi
+
+      - name: Analyze (informational)
+        working-directory: app
+        continue-on-error: true
+        run: |
+          flutter pub get
+          flutter analyze --no-fatal-infos --no-fatal-warnings || true
 
       - name: Build
         working-directory: app
