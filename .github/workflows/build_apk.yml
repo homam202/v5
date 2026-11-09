@@ -1,94 +1,132 @@
-name: Build TerraMag APK
+name: Build GeoPulse APK
+
 on:
-  workflow_dispatch:
   push:
     branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
 
 jobs:
-  apk:
+  build-android:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "17" }
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - uses: subosito/flutter-action@v2
-        with: { channel: stable, cache: true }
+        with:
+          channel: stable
+          cache: true
 
-      - name: Assemble sources
+      # Android folder is generated here, so no terminal is needed on your PC
+      - name: Generate Android project
+        run: |
+          mkdir -p lib
+          if [ ! -f lib/main.dart ] && [ -f main.dart ]; then mv main.dart lib/main.dart; fi
+          if [ ! -f lib/main.dart ]; then echo "ERROR: lib/main.dart not found in repository"; exit 1; fi
+          mkdir -p assets/icon
+          for f in app_icon.png app_icon_fg.png logo.png; do
+            if [ ! -f assets/icon/$f ] && [ -f $f ]; then mv $f assets/icon/$f; fi
+          done
+          cp -r lib /tmp/lib_backup
+          cp pubspec.yaml /tmp/pubspec_backup.yaml
+          flutter create --platforms=android --project-name geopulse --org com.geopulse .
+          rm -rf lib && cp -r /tmp/lib_backup lib
+          cp /tmp/pubspec_backup.yaml pubspec.yaml
+          rm -rf test
+
+      - name: Add Bluetooth permissions and Google Maps key
+        env:
+          MAPS_API_KEY: ${{ secrets.MAPS_API_KEY }}
         run: |
           python3 - <<'PY'
-          import os, re, glob
-          c = glob.glob('**/project_bundle*', recursive=True)
-          print('found bundle:', c)
-          t = open(c[0], encoding='utf-8').read()
-          parts = re.split(r'^=== FILE: (.+?) ===\n', t, flags=re.M)
-          for i in range(1, len(parts), 2):
-              path = 'app/' + parts[i]
-              os.makedirs(os.path.dirname(path), exist_ok=True)
-              open(path, 'w', encoding='utf-8').write(parts[i + 1])
-          print('files written:', (len(parts) - 1) // 2)
-          PY
-
-      - name: Create Android host project (keep our lib and pubspec)
-        working-directory: app
-        run: |
-          cp -r lib /tmp/lib_bak && cp pubspec.yaml /tmp/pubspec_bak.yaml
-          flutter create --platforms=android --project-name terramag --org com.terramag .
-          rm -rf lib test && cp -r /tmp/lib_bak lib && cp /tmp/pubspec_bak.yaml pubspec.yaml
-
-      - name: Bluetooth permissions and minSdk
-        working-directory: app
-        run: |
-          python3 - <<'PY'
-          p="android/app/src/main/AndroidManifest.xml"
-          s=open(p).read()
-          perms='''
-              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation"/>
+          import os, re
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p).read()
+          perms = '''<uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation"/>
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+              <uses-permission android:name="android.permission.INTERNET"/>
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
-              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30"/>
-              <uses-feature android:name="android.hardware.bluetooth_le" android:required="true"/>
-          '''
-          i=s.index('>', s.index('<manifest'))+1
-          open(p,"w").write(s[:i]+perms+s[i:])
+              '''
+          s = s.replace('<application', perms + '<application', 1)
+          key = os.environ.get('MAPS_API_KEY', '').strip()
+          if key:
+              meta = '<meta-data android:name="com.google.android.geo.API_KEY" android:value="' + key + '"/>'
+              s = re.sub(r'(<application[^>]*>)', lambda m: m.group(1) + '\n        ' + meta, s, count=1)
+              print('Google Maps key added to manifest')
+          else:
+              print('No MAPS_API_KEY secret: GPS map will use the offline view')
+          open(p, 'w').write(s)
           PY
-          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/; s/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' android/app/build.gradle* || true
 
-      # Some plugins are compiled against an older Android API than their own dependencies
-      # require. Force every module to compile against API 36.
-      - name: Force compileSdk 36 for all plugins
+      - name: Force compileSdk 36 for app and all plugins
         run: |
-          mkdir -p ~/.gradle
-          cat > ~/.gradle/init.gradle <<'GRADLE'
-          allprojects {
-              afterEvaluate { p ->
-                  def ext = p.extensions.findByName('android')
-                  if (ext != null) { ext.compileSdkVersion 36 }
+          python3 - <<'PY'
+          import os
+          # 1) app module
+          for f in ['android/app/build.gradle.kts', 'android/app/build.gradle']:
+              if os.path.exists(f):
+                  import re
+                  s = open(f).read()
+                  s = re.sub(r'compileSdk(Version)?\s*=?\s*flutter\.compileSdkVersion', 'compileSdk = 36', s)
+                  open(f, 'w').write(s)
+          # 2) every plugin module (file_picker etc.) - must run before they are evaluated
+          kts = 'android/build.gradle.kts'
+          groovy = 'android/build.gradle'
+          if os.path.exists(kts):
+              hook = """subprojects {
+              afterEvaluate {
+                  val androidExt = extensions.findByName("android")
+                  if (androidExt is com.android.build.gradle.BaseExtension) {
+                      androidExt.compileSdkVersion(36)
+                  }
               }
           }
-          GRADLE
 
-      - name: Prebuild hooks (from project)
-        working-directory: app
-        continue-on-error: true
-        run: |
-          if [ -f tool/ci_prebuild.sh ]; then bash tool/ci_prebuild.sh; else echo "no hook script"; fi
+          """
+              s = open(kts).read()
+              open(kts, 'w').write(hook + s)
+          elif os.path.exists(groovy):
+              hook = """subprojects {
+              afterEvaluate { p ->
+                  if (p.hasProperty('android')) {
+                      p.android { compileSdkVersion 36 }
+                  }
+              }
+          }
 
-      - name: Analyze (informational)
-        working-directory: app
-        continue-on-error: true
-        run: |
-          flutter pub get
-          flutter analyze --no-fatal-infos --no-fatal-warnings || true
+          """
+              s = open(groovy).read()
+              open(groovy, 'w').write(hook + s)
+          PY
+          echo "--- app gradle ---"
+          grep -n "compileSdk" android/app/build.gradle* || true
+          echo "--- root gradle ---"
+          head -20 android/build.gradle* || true
 
-      - name: Build
-        working-directory: app
-        run: |
-          flutter pub get
-          flutter build apk --release
+      - run: flutter pub get
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Build release APK
+        env:
+          HAS_KEY: ${{ secrets.MAPS_API_KEY != '' }}
+        run: flutter build apk --release --dart-define=HAS_MAPS_KEY=$HAS_KEY
 
       - uses: actions/upload-artifact@v4
         with:
-          name: terramag-apk
-          path: app/build/app/outputs/flutter-apk/app-release.apk
+          name: GeoPulse-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/app/outputs/flutter-apk/app-release.apk
