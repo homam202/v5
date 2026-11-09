@@ -1,0 +1,39 @@
+name: geopulse
+description: GeoPulse - TEFSM groundwater survey viewer (ESP32 over BLE)
+publish_to: 'none'
+version: 1.2.0+3
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  flutter_blue_plus: ^1.32.0
+  csv: ^6.0.0
+  path_provider: ^2.1.0
+  permission_handler: ^11.3.0
+  file_picker: ^8.0.0
+  shared_preferences: ^2.2.0
+  share_plus: ^10.1.0
+  google_maps_flutter: ^2.9.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icon/logo.png
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/icon/app_icon.png"
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/icon/app_icon_fg.png"
